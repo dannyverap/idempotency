@@ -5,6 +5,7 @@ public record IdempotencyEntry(
         String requestHash,
         IdempotencyStatus status,
         Integer statusCode,
+        String resourceType,
         String resourceReference,
         long createdAt,
         long updatedAt,

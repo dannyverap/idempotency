@@ -38,14 +38,16 @@ public class WrdaIdempotencyInterceptor {
 
   private final RoutingContext routingContext;
   private final IdempotencyService service;
+  private final IdempotencyReplayStrategyRegistry replayStrategies;
 
   private final ObjectMapper mapper;
 
   @Inject
   public WrdaIdempotencyInterceptor(RoutingContext routingContext, IdempotencyService service,
-      ObjectMapper mapper) {
+      IdempotencyReplayStrategyRegistry replayStrategies, ObjectMapper mapper) {
     this.routingContext = routingContext;
     this.service = service;
+    this.replayStrategies = replayStrategies;
     this.mapper = mapper;
   }
 
@@ -81,14 +83,16 @@ public class WrdaIdempotencyInterceptor {
     }
 
     String requestHash = fingerprint(ctx);
-    String storedKey = sha256(key);
+    String keyScope = routingContext.request().method().name() + "\n"
+        + routingContext.request().path() + "\n";
+    String storedKey = sha256(keyScope + key);
     AcquireResult result = service.acquire(storedKey, requestHash);
 
     if (result instanceof AcquireResult.Acquired) {
       return execute(ctx, storedKey, (IdempotencyReplayHandler) ctx.getTarget());
     }
     if (result instanceof AcquireResult.Replay(var response)) {
-      return replay((IdempotencyReplayHandler) ctx.getTarget(), response);
+      return replay(response);
     }
     if (result instanceof AcquireResult.InProgress) {
       return problem(425, "REQUEST_IN_PROGRESS",
@@ -131,12 +135,14 @@ public class WrdaIdempotencyInterceptor {
 
   private void completeQuietly(String key, Response response, IdempotencyReplayHandler replayHandler) {
     try {
-      String resourceReference = replayHandler.resourceReference(response);
-      if (resourceReference == null || resourceReference.isBlank()) {
+      ReplayReference reference = replayHandler.resourceReference(response);
+      if (reference == null || reference.resourceType() == null
+          || reference.resourceType().isBlank()
+          || reference.value() == null || reference.value().isBlank()) {
         throw new IllegalStateException(
             "Successful @WrdaIdempotency responses must provide a resource reference");
       }
-      service.complete(key, response.getStatus(), resourceReference);
+      service.complete(key, response.getStatus(), reference.resourceType(), reference.value());
     } catch (Exception e) {
       // El negocio ya hizo commit: no se le debe fallar al cliente por esto.
       LOG.errorf(e,
@@ -157,12 +163,17 @@ public class WrdaIdempotencyInterceptor {
 
   // --- Utilidades -----------------------------------------------------------
 
-  private Response replay(IdempotencyReplayHandler handler, AcquireResult.StoredResponse stored) {
+  private Response replay(AcquireResult.StoredResponse stored) {
+    if (stored.resourceType() == null || stored.resourceType().isBlank()) {
+      throw new InfrastructureException("IDEMPOTENCY_RESOURCE_TYPE_MISSING",
+          "The completed idempotency record has no resource type", null);
+    }
     if (stored.resourceReference() == null || stored.resourceReference().isBlank()) {
       throw new InfrastructureException("IDEMPOTENCY_RESOURCE_REFERENCE_MISSING",
           "The completed idempotency record has no resource reference", null);
     }
-    try (Response resourceResponse = handler.replay(stored.resourceReference(), stored.statusCode())) {
+    try (Response resourceResponse = replayStrategies.replay(stored.resourceType(),
+        stored.resourceReference(), stored.statusCode())) {
       return Response.fromResponse(resourceResponse)
           .header("Idempotency-Replayed", "true")
           .build();

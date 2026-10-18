@@ -122,18 +122,19 @@ wrda-idempotency-demo/
 ├── pom.xml                              Dependencias, OpenAPI Generator y H2
 └── src/main/
     ├── openapi/
-    │   └── orders.yaml                 Contrato de Orders API y esquema AtlasError
+    │   └── orders.yaml                 Contrato OpenAPI de orders/payments y AtlasError
     ├── resources/
     │   ├── application.properties       Datasource H2, parámetros de idempotencia
-    │   └── db/schema.sql                DDL de idempotency_keys y orders
+    │   └── db/schema.sql                DDL de idempotency_keys, orders y payments
     └── java/com/wrda/
-        ├── domain/                       Dominio de negocio (Order y validación)
+        ├── domain/                       Dominio de negocio (Order, Payment y validación)
         ├── application/
-        │   ├── orders/                   Casos de uso y puerto para órdenes
+        │   ├── orders/                   Casos de uso y puertos de orders/payments
         │   └── idempotency/              Servicio técnico y puerto de persistencia
         └── infrastructure/
-            ├── orders/http/              OrderResourceAdapter implementa OrdersApi generado
-            ├── orders/persistence/       Entidad y repositorio Panache de orders
+            ├── orders/http/              Adaptadores REST generados para orders/payments
+            ├── orders/persistence/       Entidades y repositorios Panache
+            ├── orders/replay/            Estrategias para order, payment y order-payment
             ├── error/                    WrdaErrorManagement y AtlasError de ejemplo
             └── idempotency/              Interceptor CDI, Panache, esquema y limpieza
 ```
@@ -145,16 +146,20 @@ orquestación necesaria para que la regla sea reutilizable, sin inventar un domi
 
 ### Replay con recurso persistido
 
-La tabla `orders` contiene los datos de negocio (`customer_id`, `amount`, estado y fecha). La tabla
-`idempotency_keys` conserva solo el SHA-256 de la key, el hash de la solicitud, estado, código de
-respuesta, referencia (UUID de la orden) y fechas de control. No contiene `response_body` ni datos
-de cliente.
+Las tablas `orders` y `payments` contienen los datos de negocio. `idempotency_keys` conserva solo
+el SHA-256 de la key, el hash de la solicitud, estado, código de respuesta, `resource_type`, una
+referencia a los recursos y fechas de control. No contiene `response_body` ni datos de cliente.
 
-El primer `POST` guarda la orden y devuelve su `Location`. El interceptor conserva el UUID de esa
-URI. En una repetición, `IdempotencyReplayHandler` llama al caso de uso de lectura y vuelve a
-construir la respuesta `201` con la misma orden y `Location`; **no llama al caso de uso de creación
-ni repite efectos externos**. La ruta `GET /api/orders/{orderId}` permite comprobar la orden
-guardada.
+`IdempotencyReplayStrategyRegistry` selecciona la estrategia usando `resource_type`: `order`
+reconstruye desde una orden, `payment` desde un pago y `order-payment` consulta la orden y el pago
+creados juntos. En el último caso la referencia contiene ambos UUID. La operación compuesta persiste
+ambas filas dentro de una misma transacción: si falla el pago, también se revierte la orden. Un replay
+recupera los recursos guardados y vuelve a construir el `201`; **no repite la creación ni efectos
+externos**. Las rutas GET permiten comprobar los registros persistidos.
+
+La key queda aislada por método HTTP y ruta, de modo que la misma key puede usarse, por ejemplo,
+para `POST /api/orders` y `POST /api/payments` sin colisionar. Dentro de cada ruta, el hash del body
+impide reutilizar una key completada con otra petición.
 
 No hace falta cifrar un cuerpo que ya no se guarda en la tabla idempotente. Los hashes no son
 cifrado: para solicitudes con datos sensibles o de baja entropía, conviene usar un HMAC con secreto
@@ -248,6 +253,28 @@ curl -i http://localhost:8080/api/orders/<orderId>
 
 El endpoint `GET` lee el mismo registro persistido que el replay utiliza para reconstruir el `201`.
 
+### Pago individual y creación compuesta
+
+Se puede crear un pago para una orden existente con `POST /api/payments`; su replay reconstruye
+`PaymentResponse` desde `payments`:
+
+```bash
+curl -i -X POST http://localhost:8080/api/payments \
+  -H "Content-Type: application/json" -H "Idempotency-Key: payment-001" \
+  -d '{"orderId":"<orderId>","amount":150.50}'
+```
+
+`POST /api/orders/with-payment` demuestra el caso donde una petición crea filas en dos tablas:
+
+```bash
+curl -i -X POST http://localhost:8080/api/orders/with-payment \
+  -H "Content-Type: application/json" -H "Idempotency-Key: order-payment-001" \
+  -d '{"customerId":"C-100","amount":150.50}'
+```
+
+La respuesta contiene `order` y `payment`. Repetir la llamada con la misma key/body devuelve ambas
+entidades persistidas, con sus mismos IDs, sin crear registros adicionales.
+
 ### Caso 4: un fallo no bloquea los reintentos
 
 ```bash
@@ -292,9 +319,9 @@ Esperado: una petición con `201` y tres con `425`. En el log, un solo "Procesan
 La base de datos está en memoria y vive dentro del proceso de Quarkus; se puede consultar desde el
 depurador o una herramienta H2 conectada al proceso. Al detener la aplicación, los datos se pierden.
 
-`db/schema.sql` crea ambas tablas. `orders` guarda los datos del pedido y `idempotency_keys` solo
-metadata y el UUID necesario para reconstruir el replay. H2 está en memoria; al detener la
-aplicación se reinician las dos tablas.
+`db/schema.sql` crea `orders`, `payments` e `idempotency_keys`. La tabla idempotente guarda metadata
+y referencias a uno o varios recursos, no los datos de negocio ni una copia del body de respuesta.
+H2 está en memoria; al detener la aplicación se reinician las tablas.
 
 ### Reutilizarlo en otra API
 

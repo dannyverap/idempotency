@@ -30,6 +30,9 @@ public class IdempotencyRecord extends PanacheEntityBase {
     @Column(name = "resource_reference", length = 100)
     public String resourceReference;
 
+    @Column(name = "resource_type", length = 100)
+    public String resourceType;
+
     /** Epoch en milisegundos. */
     @Column(name = "created_at", nullable = false)
     public long createdAt;

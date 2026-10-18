@@ -48,7 +48,8 @@ public class IdempotencyRepository
       IdempotencyRecord idempotencyRecord = find("idempotencyKey", key).firstResult();
       return idempotencyRecord == null ? null
           : new IdempotencyEntry(idempotencyRecord.requestHash, idempotencyRecord.status,
-              idempotencyRecord.statusCode, idempotencyRecord.resourceReference,
+              idempotencyRecord.statusCode, idempotencyRecord.resourceType,
+              idempotencyRecord.resourceReference,
               idempotencyRecord.createdAt, idempotencyRecord.updatedAt,
               idempotencyRecord.expiresAt);
     });
@@ -101,11 +102,12 @@ public class IdempotencyRepository
    * IN_PROGRESS -> COMPLETED guardando solo una referencia al recurso creado.
    */
   @Override
-  public boolean markCompleted(String key, int statusCode, String resourceReference, long now) {
+  public boolean markCompleted(String key, int statusCode, String resourceType,
+      String resourceReference, long now) {
     return persistence("complete idempotency key", () -> {
-      int rows = update("status = ?1, statusCode = ?2, resourceReference = ?3, updatedAt = ?4 "
-              + "where idempotencyKey = ?5 and status = ?6",
-          IdempotencyStatus.COMPLETED, statusCode, resourceReference, now,
+      int rows = update("status = ?1, statusCode = ?2, resourceType = ?3, resourceReference = ?4, "
+              + "updatedAt = ?5 where idempotencyKey = ?6 and status = ?7",
+          IdempotencyStatus.COMPLETED, statusCode, resourceType, resourceReference, now,
           key, IdempotencyStatus.IN_PROGRESS);
       return rows == 1;
     });

@@ -2,10 +2,8 @@ package com.wrda.infrastructure.idempotency.http;
 
 import jakarta.ws.rs.core.Response;
 
-/** Rebuilds the original successful HTTP response from a persisted resource reference. */
+/** Extracts stable resource identifiers from a successful response. */
 public interface IdempotencyReplayHandler {
 
-    String resourceReference(Response successfulResponse);
-
-    Response replay(String resourceReference, int statusCode);
+    ReplayReference resourceReference(Response successfulResponse);
 }

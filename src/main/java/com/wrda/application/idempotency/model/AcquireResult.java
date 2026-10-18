@@ -16,5 +16,5 @@ public sealed interface AcquireResult {
     record KeyReused() implements AcquireResult {}
 
     /** Referencia minima necesaria para reconstruir una respuesta exitosa. */
-    record StoredResponse(int statusCode, String resourceReference) {}
+    record StoredResponse(int statusCode, String resourceType, String resourceReference) {}
 }
