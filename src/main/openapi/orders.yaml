@@ -62,6 +62,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AtlasError'
+  /api/orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: Get a persisted order
+      tags:
+        - orders
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Persisted order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '500':
+          description: Order storage or replay reference failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtlasError'
 components:
   schemas:
     CreateOrderRequest:

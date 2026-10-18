@@ -14,7 +14,7 @@ import jakarta.persistence.Table;
 public class IdempotencyRecord extends PanacheEntityBase {
 
     @Id
-    @Column(name = "idempotency_key", length = 100)
+    @Column(name = "idempotency_key", length = 64)
     public String idempotencyKey;
 
     @Column(name = "request_hash", nullable = false, length = 64)
@@ -27,14 +27,8 @@ public class IdempotencyRecord extends PanacheEntityBase {
     @Column(name = "status_code")
     public Integer statusCode;
 
-    @Column(name = "response_body")
-    public String responseBody;
-
-    @Column(name = "content_type", length = 100)
-    public String contentType;
-
-    @Column(name = "location", length = 500)
-    public String location;
+    @Column(name = "resource_reference", length = 100)
+    public String resourceReference;
 
     /** Epoch en milisegundos. */
     @Column(name = "created_at", nullable = false)

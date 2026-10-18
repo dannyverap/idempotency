@@ -1,13 +1,14 @@
 # wrda-idempotency-demo — guía de lectura y uso
 
-Proyecto de ejemplo en **Quarkus 3.33 (LTS) + Java 21 + H2 en memoria + Panache** que implementa el patrón
-*Idempotency Key / Replay* con una anotación propia: `@WrdaIdempotency`.
+Proyecto de ejemplo en **Quarkus 3.33 (LTS) + Java 21 + H2 en memoria + Panache** que implementa el
+patrón *Idempotency Key / Replay* con una anotación propia: `@WrdaIdempotency`.
 
 ## 1. La idea principal
 
-**Qué es:** un *interceptor CDI* que envuelve un método de resource JAX-RS. Antes de ejecutar el
-negocio "reclama" la `Idempotency-Key` en una tabla; después guarda la respuesta exitosa para poder
-repetirla.
+**Qué es:** un *interceptor CDI* que reclama la `Idempotency-Key` antes de ejecutar el negocio.
+Después de crear el recurso, el registro de idempotencia conserva una referencia al recurso, no
+una copia de todo el cuerpo HTTP. Un replay vuelve a leer el recurso persistido y reconstruye la
+respuesta sin repetir la operación que lo creó.
 
 **Qué NO es:**
 
@@ -28,10 +29,10 @@ y lo manda en el header `Idempotency-Key`; reintentar con esa misma key nunca re
 |---------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | `IN_PROGRESS` se inserta en una transacción **propia** (`REQUIRES_NEW`) y se confirma antes del negocio | Otra petición con la misma key debe *verlo* al instante y responder `425` sin esperar | Si el proceso muere a mitad, queda un `IN_PROGRESS` huérfano → se retoma tras `in-progress-timeout` |
 | El interceptor corre **por fuera** de `@Transactional` (prioridad 100 < 200)                            | `complete`/`release` deben ejecutarse *después* del commit o rollback del negocio     | Hay una ventana mínima entre ambos commits                                                          |
-| `MERGE ... WHEN NOT MATCHED` + leer filas afectadas                                                      | Reclama la key atómicamente sin modificar una fila existente                           | Cero excepciones de clave duplicada en el camino de concurrencia                                    |
+| `MERGE ... WHEN NOT MATCHED` + leer filas afectadas                                                     | Reclama la key atómicamente sin modificar una fila existente                          | Cero excepciones de clave duplicada en el camino de concurrencia                                    |
 | Solo 200/201 se guardan                                                                                 | Un error debe poder reintentarse con la misma key                                     | El reintento re-evalúa con el estado actual del negocio                                             |
-| El método debe retornar `Response`                                                                      | El interceptor necesita status, body y `Location`                                     | Si no, falla al primer uso con un mensaje claro                                                     |
-| Fechas como epoch en milisegundos                                                                       | Facilita comparar y expirar registros                                                    | Columnas `BIGINT`                                                                                   |
+| El resource devuelve `Response` e implementa `IdempotencyReplayHandler`                                 | El interceptor necesita status y una referencia a un recurso persistido               | El replay reconstruye la respuesta sin guardar el body en `idempotency_keys`                        |
+| Fechas como epoch en milisegundos                                                                       | Facilita comparar y expirar registros                                                 | Columnas `BIGINT`                                                                                   |
 
 **Malentendidos comunes**
 
@@ -46,16 +47,16 @@ y lo manda en el header `Idempotency-Key`; reintentar con esa misma key nunca re
 ```mermaid
 flowchart TD
     R[Request a metodo con @WrdaIdempotency] --> H{Header Idempotency-Key presente?}
-    H -- no --> E400[400 IDEMPOTENCY_KEY_REQUIRED]
-    H -- si -->     ACQ[acquire: MERGE atomico en transaccion propia]
-    ACQ --> Q{Resultado}
-    Q -- Acquired --> X[Ejecutar logica de negocio]
-    Q -- Replay --> P[Devolver respuesta guardada + Idempotency-Replayed true]
-    Q -- InProgress --> T[425 Too Early + Retry-After 1]
-    Q -- KeyReused --> U[422 IDEMPOTENCY_KEY_REUSED]
-    X --> S{Resultado del negocio}
-    S -- 200 o 201 --> C[complete: COMPLETED + respuesta guardada]
-    S -- otro status o excepcion --> L[release: borrar el IN_PROGRESS]
+H -- no --> E400[400 IDEMPOTENCY_KEY_REQUIRED]
+H -- si --> ACQ[acquire: MERGE atomico en transaccion propia]
+ACQ --> Q{Resultado}
+Q -- Acquired --> X[Ejecutar logica de negocio]
+Q -- Replay --> P[Buscar el recurso por referencia y reconstruir respuesta]
+Q -- InProgress --> T[425 Too Early + Retry-After 1]
+Q -- KeyReused --> U[422 IDEMPOTENCY_KEY_REUSED]
+X --> S{Resultado del negocio}
+S -- 200 o 201 --> C[complete: COMPLETED + referencia del recurso]
+S -- otro status o excepcion --> L[release: borrar el IN_PROGRESS]
 ```
 
 ## 4. Recorrido de dos peticiones concurrentes
@@ -67,21 +68,26 @@ sequenceDiagram
     participant I as Interceptor
     participant D as H2
     participant N as Negocio
-    A->>I: POST /api/orders key=K1
-    I->>D: MERGE K1 IN_PROGRESS (commit)
-    D-->>I: 1 fila, Acquired
-    I->>N: proceed()
-    B->>I: POST /api/orders key=K1
-    I->>D: MERGE K1 (0 filas) y SELECT
-    D-->>I: IN_PROGRESS
-    I-->>B: 425 Too Early
-    N-->>I: 201 Created
-    I->>D: UPDATE K1 a COMPLETED con la respuesta (commit)
-    I-->>A: 201 Created
-    B->>I: reintento key=K1
-    I->>D: SELECT K1
-    D-->>I: COMPLETED
-    I-->>B: 201 Created con Idempotency-Replayed true
+    A ->> I: POST /api/orders key=K1
+    I ->> D: MERGE K1 IN_PROGRESS (commit)
+    D -->> I: 1 fila, Acquired
+    I ->> N: proceed()
+    B ->> I: POST /api/orders key=K1
+    I ->> D: MERGE K1 (0 filas) y SELECT
+    D -->> I: IN_PROGRESS
+    I -->> B: 425 Too Early
+    N ->> D: INSERT orden en orders (commit)
+    I ->> D: UPDATE K1 a COMPLETED con resource_reference (commit)
+    N -->> I: 201 Created
+    I -->> A: 201 Created
+    B ->> I: reintento key=K1
+    I ->> D: SELECT K1 (hash, estado, referencia)
+    D -->> I: COMPLETED
+    I ->> N: Buscar orden persistida por id
+    N ->> D: SELECT orden
+    D -->> N: Orden original
+    N -->> I: reconstruir respuesta 201
+    I -->> B: 201 Created con Idempotency-Replayed true
 ```
 
 ## 5. Paso a paso: del build al resultado
@@ -93,17 +99,18 @@ sequenceDiagram
 3. **Arranque.** `SchemaInitializer` ejecuta `db/schema.sql` (idempotente: `IF NOT EXISTS`).
 4. **Request.** Llega `POST /api/orders`; `WrdaErrorManagementInterceptor` envuelve el flujo para
    convertir excepciones a `AtlasError`, y `WrdaIdempotencyInterceptor` gestiona la key.
-5. Valida el header `Idempotency-Key` (`400` si falta) y calcula el `request_hash` (SHA-256 de
-   método + path + body deserializado).
+5. Valida el header `Idempotency-Key` (`400` si falta), calcula su hash para no guardar la key en
+   claro y calcula `request_hash` (SHA-256 de método + path + parámetros de la solicitud).
 6. Llama a `IdempotencyService.acquire` (transacción corta): `MERGE ... WHEN NOT MATCHED`.
     - 1 fila insertada → eres el primero → `Acquired`.
     - 0 filas → lee la fila existente y decide: `Replay`, `InProgress`, `KeyReused`, o retoma un
       `IN_PROGRESS` huérfano.
 7. Si `Acquired`: `ctx.proceed()` ejecuta el negocio (aquí, el `Thread.sleep`).
-8. Resultado: `200/201` → `complete` guarda status, body y `Location`; cualquier otro status o
-   excepción → `release` borra la fila.
-9. El cliente recibe la respuesta. Un reintento con la misma key devuelve lo guardado sin ejecutar
-   nada.
+8. La orden queda guardada en `orders`. Para `201`, `complete` guarda el estado y solo el UUID de
+   la orden como `resource_reference`; no serializa la respuesta. Otros status o excepciones
+   liberan la key.
+9. El cliente recibe la respuesta. Un reintento con la misma key no repite la creación: busca la
+   orden por UUID y construye de nuevo el `201`.
 
 ## 6. Estructura del repositorio
 
@@ -118,14 +125,15 @@ wrda-idempotency-demo/
     │   └── orders.yaml                 Contrato de Orders API y esquema AtlasError
     ├── resources/
     │   ├── application.properties       Datasource H2, parámetros de idempotencia
-    │   └── db/schema.sql                DDL de idempotency_keys
+    │   └── db/schema.sql                DDL de idempotency_keys y orders
     └── java/com/wrda/
         ├── domain/                       Dominio de negocio (Order y validación)
         ├── application/
-        │   ├── orders/                   Caso de uso de creación de órdenes
+        │   ├── orders/                   Casos de uso y puerto para órdenes
         │   └── idempotency/              Servicio técnico y puerto de persistencia
         └── infrastructure/
             ├── orders/http/              OrderResourceAdapter implementa OrdersApi generado
+            ├── orders/persistence/       Entidad y repositorio Panache de orders
             ├── error/                    WrdaErrorManagement y AtlasError de ejemplo
             └── idempotency/              Interceptor CDI, Panache, esquema y limpieza
 ```
@@ -134,6 +142,24 @@ La idempotencia es una capacidad técnica transversal, no parte del dominio de `
 de aplicación coordina el protocolo y depende del puerto `IdempotencyStore`; Panache, H2 y el
 interceptor HTTP quedan en infraestructura. Se conserva dentro de `application` solo la
 orquestación necesaria para que la regla sea reutilizable, sin inventar un dominio de idempotencia.
+
+### Replay con recurso persistido
+
+La tabla `orders` contiene los datos de negocio (`customer_id`, `amount`, estado y fecha). La tabla
+`idempotency_keys` conserva solo el SHA-256 de la key, el hash de la solicitud, estado, código de
+respuesta, referencia (UUID de la orden) y fechas de control. No contiene `response_body` ni datos
+de cliente.
+
+El primer `POST` guarda la orden y devuelve su `Location`. El interceptor conserva el UUID de esa
+URI. En una repetición, `IdempotencyReplayHandler` llama al caso de uso de lectura y vuelve a
+construir la respuesta `201` con la misma orden y `Location`; **no llama al caso de uso de creación
+ni repite efectos externos**. La ruta `GET /api/orders/{orderId}` permite comprobar la orden
+guardada.
+
+No hace falta cifrar un cuerpo que ya no se guarda en la tabla idempotente. Los hashes no son
+cifrado: para solicitudes con datos sensibles o de baja entropía, conviene usar un HMAC con secreto
+gestionado fuera del código. Los datos de negocio de `orders` requieren sus propios controles de
+acceso y política de cifrado según el entorno.
 
 ### Contrato OpenAPI y manejo de errores
 
@@ -159,14 +185,14 @@ Atlas; las anotaciones y el manejo tipado de excepciones se pueden conservar.
 
 ## 7. Configuración
 
-| Propiedad                                          | Ejemplo                                                                                    | Para qué sirve                                                                                               |
-|----------------------------------------------------|--------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| `quarkus.datasource.db-kind`                       | `h2`                                                                                        | Usa la extensión JDBC de H2 incluida en el proyecto                                                           |
-| `quarkus.datasource.jdbc.url`                      | `jdbc:h2:mem:idempotency;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;LOCK_TIMEOUT=5000`       | Base en memoria; se crea al arrancar y sus datos se pierden al detener la aplicación                         |
-| `quarkus.hibernate-orm.schema-management.strategy` | `none`                                                                                     | El esquema lo crea `SchemaInitializer`, no Hibernate                                                         |
-| `wrda.idempotency.ttl`                             | `PT24H`                                                                                    | Cuánto tiempo se puede hacer replay de una key                                                               |
-| `wrda.idempotency.in-progress-timeout`             | `PT30S`                                                                                    | Edad a partir de la cual un `IN_PROGRESS` se considera huérfano. Debe superar la duración máxima del negocio |
-| `wrda.idempotency.cleanup-every`                   | `5m`                                                                                       | Frecuencia del job de limpieza                                                                               |
+| Propiedad                                          | Ejemplo                                                                              | Para qué sirve                                                                                               |
+|----------------------------------------------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `quarkus.datasource.db-kind`                       | `h2`                                                                                 | Usa la extensión JDBC de H2 incluida en el proyecto                                                          |
+| `quarkus.datasource.jdbc.url`                      | `jdbc:h2:mem:idempotency;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;LOCK_TIMEOUT=5000` | Base en memoria; se crea al arrancar y sus datos se pierden al detener la aplicación                         |
+| `quarkus.hibernate-orm.schema-management.strategy` | `none`                                                                               | El esquema lo crea `SchemaInitializer`, no Hibernate                                                         |
+| `wrda.idempotency.ttl`                             | `PT24H`                                                                              | Cuánto tiempo se puede hacer replay de una key                                                               |
+| `wrda.idempotency.in-progress-timeout`             | `PT30S`                                                                              | Edad a partir de la cual un `IN_PROGRESS` se considera huérfano. Debe superar la duración máxima del negocio |
+| `wrda.idempotency.cleanup-every`                   | `5m`                                                                                 | Frecuencia del job de limpieza                                                                               |
 
 ## 8. Compilar, ejecutar y probar
 
@@ -212,6 +238,16 @@ Con el mismo comando, ya terminada la 1ª: responde al instante `201 Created`, h
 `Idempotency-Replayed: true` y **el mismo** `orderId` y `createdAt`. En el log de la aplicación no
 aparece un nuevo "Procesando orden".
 
+### Consultar la orden almacenada
+
+Usa el `orderId` que aparece al final de `Location`:
+
+```bash
+curl -i http://localhost:8080/api/orders/<orderId>
+```
+
+El endpoint `GET` lee el mismo registro persistido que el replay utiliza para reconstruir el `201`.
+
 ### Caso 4: un fallo no bloquea los reintentos
 
 ```bash
@@ -256,9 +292,14 @@ Esperado: una petición con `201` y tres con `425`. En el log, un solo "Procesan
 La base de datos está en memoria y vive dentro del proceso de Quarkus; se puede consultar desde el
 depurador o una herramienta H2 conectada al proceso. Al detener la aplicación, los datos se pierden.
 
+`db/schema.sql` crea ambas tablas. `orders` guarda los datos del pedido y `idempotency_keys` solo
+metadata y el UUID necesario para reconstruir el replay. H2 está en memoria; al detener la
+aplicación se reinician las dos tablas.
+
 ### Reutilizarlo en otra API
 
-1. Copia el paquete `com.wrda.infrastructure.idempotency` y sus contratos de `com.wrda.application.idempotency` (o extráelos a una librería propia).
+1. Copia el paquete `com.wrda.infrastructure.idempotency` y sus contratos de
+   `com.wrda.application.idempotency` (o extráelos a una librería propia).
 2. Agrega las dependencias del `pom.xml` y la tabla (`db/schema.sql`).
 3. Anota tus métodos con `@WrdaIdempotency`. Deben retornar `jakarta.ws.rs.core.Response`.
 
@@ -274,8 +315,9 @@ depurador o una herramienta H2 conectada al proceso. Al detener la aplicación, 
 - **`in-progress-timeout` mayor que tu operación más lenta.** Si es menor, una petición legítima
   lenta podría ser "retomada" por otra.
 - **El hash cubre método, path y body**, no los headers.
-- **`response_body` guarda la respuesta en claro.** En un caso real con datos sensibles, guarda solo
-  una referencia (por ejemplo el id del recurso) o cifra la columna, y no loguees ese contenido.
+- **El replay requiere que el recurso referenciado siga disponible.** Si se elimina la orden antes
+  de que venza la key, no se puede reconstruir el replay; devuelve un error explícito en vez de
+  ejecutar la creación otra vez.
 - **El método anotado debe retornar `Response`** y sus parámetros deben ser serializables con
   Jackson (el body); evita parámetros `@Context`.
 - **El `Thread.sleep`** solo existe para probar la carrera a mano; el método usa `@Blocking` para
@@ -284,12 +326,21 @@ depurador o una herramienta H2 conectada al proceso. Al detener la aplicación, 
 ## 10. Ruta recomendada de lectura del código
 
 1. `infrastructure/idempotency/http/WrdaIdempotency.java`: la anotación.
-2. `src/main/openapi/orders.yaml` y `infrastructure/orders/http/OrderResourceAdapter.java`: contrato y adaptador HTTP.
-3. `infrastructure/error/WrdaManagedEndpoint.java` y `WrdaErrorManagementInterceptor.java`: bindings compuestos y mapeo AtlasError.
-4. `infrastructure/idempotency/http/WrdaIdempotencyInterceptor.java`: coordinación del request y replay.
+2. `src/main/openapi/orders.yaml` y `infrastructure/orders/http/OrderResourceAdapter.java`: contrato
+   y adaptador HTTP.
+3. `infrastructure/error/WrdaManagedEndpoint.java` y `WrdaErrorManagementInterceptor.java`: bindings
+   compuestos y mapeo AtlasError.
+4. `infrastructure/idempotency/http/WrdaIdempotencyInterceptor.java`: coordinación del request y
+   replay.
 5. `application/idempotency/IdempotencyService.java`: las reglas de decisión de `acquire`.
 6. `application/idempotency/port/out/IdempotencyStore.java`: el puerto de persistencia.
-7. `infrastructure/idempotency/persistence/IdempotencyRepository.java`: las sentencias atómicas.
-8. `application/idempotency/model/AcquireResult.java` y `IdempotencyStatus.java`: resultados y estados del protocolo.
-9. `infrastructure/idempotency/persistence/IdempotencyRecord.java` y `db/schema.sql`: el mapeo y la tabla.
-10. `application.properties`, `SchemaInitializer.java` y `IdempotencyCleanupJob.java`: configuración y mantenimiento.
+7. `infrastructure/idempotency/persistence/IdempotencyRepository.java`: las sentencias atómicas y la
+   referencia al recurso.
+8. `application/idempotency/model/AcquireResult.java` y `IdempotencyStatus.java`: resultados y
+   estados del protocolo.
+9. `infrastructure/idempotency/persistence/IdempotencyRecord.java` y `db/schema.sql`: la metadata de
+   idempotencia.
+10. `infrastructure/orders/persistence/OrderRecord.java` y `OrderRepository.java`: persistencia de
+    órdenes.
+11. `application.properties`, `SchemaInitializer.java` y `IdempotencyCleanupJob.java`: configuración
+    y mantenimiento.

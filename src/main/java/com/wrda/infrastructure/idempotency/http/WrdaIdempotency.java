@@ -10,8 +10,9 @@ import java.lang.annotation.Target;
 /**
  * Marca un metodo de resource JAX-RS como idempotente via header {@code Idempotency-Key}.
  * <p>
- * Requisito: el metodo debe retornar {@link jakarta.ws.rs.core.Response}.
- * Solo se guardan (y se re-envian) respuestas 200/201.
+ * Requisitos: el metodo retorna {@link jakarta.ws.rs.core.Response} y su resource
+ * implementa {@link IdempotencyReplayHandler}. Solo se guardan respuestas 200/201;
+ * se conserva una referencia al recurso para reconstruir el replay.
  */
 @InterceptorBinding
 @Retention(RetentionPolicy.RUNTIME)

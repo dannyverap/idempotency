@@ -73,16 +73,14 @@ public class IdempotencyService {
     // Terminada con exito: replay. Si no, sigue en ejecucion.
     if (existing.status() == IdempotencyStatus.COMPLETED) {
       return new AcquireResult.Replay(new AcquireResult.StoredResponse(
-          existing.statusCode(), existing.responseBody(),
-          existing.contentType(), existing.location()));
+          existing.statusCode(), existing.resourceReference()));
     }
     return new AcquireResult.InProgress();
   }
 
   @Transactional(Transactional.TxType.REQUIRES_NEW)
-  public void complete(String key, int statusCode, String body, String contentType,
-      String location) {
-    store.markCompleted(key, statusCode, body, contentType, location, System.currentTimeMillis());
+  public void complete(String key, int statusCode, String resourceReference) {
+    store.markCompleted(key, statusCode, resourceReference, System.currentTimeMillis());
   }
 
   @Transactional(Transactional.TxType.REQUIRES_NEW)
