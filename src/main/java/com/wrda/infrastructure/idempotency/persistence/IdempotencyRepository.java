@@ -1,0 +1,109 @@
+package com.wrda.infrastructure.idempotency.persistence;
+
+import com.wrda.application.idempotency.model.IdempotencyEntry;
+import com.wrda.application.idempotency.model.IdempotencyStatus;
+import com.wrda.application.idempotency.port.out.IdempotencyStore;
+import com.wrda.infrastructure.error.InfrastructureException;
+import io.quarkus.hibernate.orm.panache.PanacheRepositoryBase;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.hibernate.Session;
+
+import java.util.function.Supplier;
+
+/**
+ * Cada metodo es UNA sentencia SQL atomica. Se evita a proposito el patron
+ * "consultar y luego insertar" y las excepciones por PK duplicada
+ * (dejarian la transaccion en rollback-only). H2 ignora el conflicto de PK con
+ * MERGE WHEN NOT MATCHED, manteniendo la reclamacion atomica sin cambiar una key existente.
+ */
+@ApplicationScoped
+public class IdempotencyRepository
+        implements PanacheRepositoryBase<IdempotencyRecord, String>, IdempotencyStore {
+
+    @SuppressWarnings("SqlResolve")
+    private static final String INSERT_IN_PROGRESS_SQL =
+            "MERGE INTO idempotency_keys "
+                    + "USING (VALUES (?1, ?2, 'IN_PROGRESS', ?3, ?4, ?5)) "
+                    + "AS new_key(idempotency_key, request_hash, status, created_at, updated_at, expires_at) "
+                    + "ON idempotency_keys.idempotency_key = new_key.idempotency_key "
+                    + "WHEN NOT MATCHED THEN "
+                    + "INSERT (idempotency_key, request_hash, status, created_at, updated_at, expires_at) "
+                    + "VALUES (new_key.idempotency_key, new_key.request_hash, new_key.status, "
+                    + "new_key.created_at, new_key.updated_at, new_key.expires_at)";
+
+    @Override
+    public IdempotencyEntry findEntry(String key) {
+        return persistence("read idempotency key", () -> {
+            IdempotencyRecord idempotencyRecord = find("idempotencyKey", key).firstResult();
+            return idempotencyRecord == null ? null : new IdempotencyEntry(idempotencyRecord.requestHash, idempotencyRecord.status,
+                    idempotencyRecord.statusCode, idempotencyRecord.responseBody, idempotencyRecord.contentType, idempotencyRecord.location,
+                    idempotencyRecord.createdAt, idempotencyRecord.updatedAt, idempotencyRecord.expiresAt);
+        });
+    }
+
+    /** @return true si inserto la fila (eres el primero); false si la key ya existia. */
+    @Override
+    // The EntityManager owns this Session; closing it here would break the transaction.
+    @SuppressWarnings("resource")
+    public boolean insertInProgress(String key, String requestHash, long now, long expiresAt) {
+        return persistence("claim idempotency key", () -> {
+            int rows = getEntityManager().unwrap(Session.class)
+                    .createNativeMutationQuery(INSERT_IN_PROGRESS_SQL)
+                    .setParameter(1, key)
+                    .setParameter(2, requestHash)
+                    .setParameter(3, now)
+                    .setParameter(4, now)
+                    .setParameter(5, expiresAt)
+                    .executeUpdate();
+            return rows == 1;
+        });
+    }
+
+    /** Retoma un IN_PROGRESS huerfano (mas viejo que staleBefore). */
+    @Override
+    public boolean takeOverStale(String key, String requestHash, long now, long expiresAt, long staleBefore) {
+        return persistence("take over stale idempotency key", () -> {
+            int rows = update("requestHash = ?1, createdAt = ?2, updatedAt = ?3, expiresAt = ?4 "
+                            + "where idempotencyKey = ?5 and status = ?6 and updatedAt < ?7",
+                    requestHash, now, now, expiresAt, key, IdempotencyStatus.IN_PROGRESS, staleBefore);
+            return rows == 1;
+        });
+    }
+
+    /** IN_PROGRESS -> COMPLETED guardando la respuesta. */
+    @Override
+    public boolean markCompleted(String key, int statusCode, String body, String contentType,
+                                 String location, long now) {
+        return persistence("complete idempotency key", () -> {
+            int rows = update("status = ?1, statusCode = ?2, responseBody = ?3, contentType = ?4, "
+                            + "location = ?5, updatedAt = ?6 where idempotencyKey = ?7 and status = ?8",
+                    IdempotencyStatus.COMPLETED, statusCode, body, contentType, location, now,
+                    key, IdempotencyStatus.IN_PROGRESS);
+            return rows == 1;
+        });
+    }
+
+    /** Borra el IN_PROGRESS (si falla la ejecucion) para no bloquear reintentos legitimos. */
+    @Override
+    public long releaseInProgress(String key) {
+        return persistence("release idempotency key", () ->
+                delete("idempotencyKey = ?1 and status = ?2", key, IdempotencyStatus.IN_PROGRESS));
+    }
+
+    @Override
+    public long deleteExpired(long now) {
+        return persistence("delete expired idempotency keys", () -> delete("expiresAt < ?1", now));
+    }
+
+    private <T> T persistence(String operation, Supplier<T> action) {
+        try {
+            return action.get();
+        } catch (RuntimeException exception) {
+            if (exception instanceof InfrastructureException infrastructureException) {
+                throw infrastructureException;
+            }
+            throw new InfrastructureException("IDEMPOTENCY_STORAGE_FAILURE",
+                    "Could not " + operation, exception);
+        }
+    }
+}

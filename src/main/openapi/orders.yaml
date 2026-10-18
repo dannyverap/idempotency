@@ -1,0 +1,124 @@
+openapi: 3.0.3
+info:
+  title: Orders API
+  version: 1.0.0
+  description: Example order creation contract with idempotency support.
+servers:
+  - url: /
+paths:
+  /api/orders:
+    post:
+      operationId: createOrder
+      summary: Create an order
+      tags:
+        - orders
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Required by the Wrda idempotency interceptor.
+          schema:
+            type: string
+            maxLength: 100
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          description: Missing idempotency key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtlasError'
+        '422':
+          description: Domain validation error or idempotency key reused with a different request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtlasError'
+        '425':
+          description: Request with this key is already in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtlasError'
+        '500':
+          description: Application or infrastructure error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtlasError'
+components:
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required:
+        - customerId
+        - amount
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+        amount:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+        simulateFailure:
+          type: boolean
+          default: false
+    OrderResponse:
+      type: object
+      required:
+        - orderId
+        - customerId
+        - amount
+        - status
+        - createdAt
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+        amount:
+          type: number
+        status:
+          type: string
+          enum:
+            - CREATED
+        createdAt:
+          type: string
+          format: date-time
+    AtlasError:
+      type: object
+      required:
+        - code
+        - message
+        - category
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        category:
+          type: string
+          enum:
+            - DOMAIN
+            - APPLICATION
+            - INFRASTRUCTURE
+            - IDEMPOTENCY
+            - UNEXPECTED

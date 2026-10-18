@@ -1,0 +1,29 @@
+# Maven / Quarkus build output
+target/
+
+# Local database files and sidecars
+idempotency.db*
+*.db
+*.db-shm
+*.db-wal
+
+# IDE configuration and project files
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Logs and JVM crash dumps
+*.log
+hs_err_pid*
+
+# Local environment overrides (keep example templates)
+.env
+.env.*
+!.env.example
