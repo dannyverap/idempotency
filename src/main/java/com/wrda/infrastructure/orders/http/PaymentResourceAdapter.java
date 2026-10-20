@@ -7,20 +7,18 @@ import com.wrda.domain.Payment;
 import com.wrda.infrastructure.error.InfrastructureException;
 import com.wrda.infrastructure.error.WrdaErrorManagement;
 import com.wrda.infrastructure.error.WrdaManagedEndpoint;
-import com.wrda.infrastructure.idempotency.http.IdempotencyReplayHandler;
-import com.wrda.infrastructure.idempotency.http.ReplayReference;
 import com.wrda.infrastructure.orders.contract.api.PaymentsApi;
 import com.wrda.infrastructure.orders.contract.model.CreatePaymentRequest;
-import com.wrda.infrastructure.orders.contract.model.PaymentResponse;
 import io.smallrye.common.annotation.Blocking;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
 import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.core.Response;
 
 import java.net.URI;
 import java.util.UUID;
 
-public class PaymentResourceAdapter implements PaymentsApi, IdempotencyReplayHandler {
+public class PaymentResourceAdapter implements PaymentsApi {
 
     private final CreatePaymentService createPaymentService;
     private final GetPaymentService getPaymentService;
@@ -34,6 +32,7 @@ public class PaymentResourceAdapter implements PaymentsApi, IdempotencyReplayHan
 
     @Override
     @Blocking
+    @Transactional
     @WrdaManagedEndpoint
     public Response createPayment(@HeaderParam("Idempotency-Key") String idempotencyKey,
                                   CreatePaymentRequest request) {
@@ -58,12 +57,4 @@ public class PaymentResourceAdapter implements PaymentsApi, IdempotencyReplayHan
         return Response.ok(OrderApiMapper.toPaymentResponse(payment)).build();
     }
 
-    @Override
-    public ReplayReference resourceReference(Response successfulResponse) {
-        if (successfulResponse.getEntity() instanceof PaymentResponse response) {
-            return new ReplayReference("payment", response.getPaymentId().toString());
-        }
-        throw new InfrastructureException("UNSUPPORTED_REPLAY_RESPONSE",
-                "No replay reference extractor exists for this response type", null);
-    }
 }

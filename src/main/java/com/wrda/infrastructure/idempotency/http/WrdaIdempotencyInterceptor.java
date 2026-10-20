@@ -3,211 +3,202 @@ package com.wrda.infrastructure.idempotency.http;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wrda.application.idempotency.IdempotencyService;
 import com.wrda.application.idempotency.model.AcquireResult;
-import com.wrda.infrastructure.error.InfrastructureException;
+import com.wrda.infrastructure.idempotency.security.IdempotencyHmac;
+import com.wrda.infrastructure.idempotency.security.ResponseEncryption;
 import com.wrda.infrastructure.orders.contract.model.AtlasError;
+import io.quarkus.security.identity.SecurityIdentity;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.annotation.Priority;
+import jakarta.inject.Inject;
 import jakarta.interceptor.AroundInvoke;
 import jakarta.interceptor.Interceptor;
 import jakarta.interceptor.InvocationContext;
-import jakarta.inject.Inject;
+import jakarta.transaction.Status;
+import jakarta.transaction.TransactionSynchronizationRegistry;
+import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.HeaderParam;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.HexFormat;
-import java.util.ArrayList;
-import java.util.List;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
-/**
- * Prioridad 100 < 200 (la del @Transactional de Quarkus): este interceptor corre POR FUERA de
- * cualquier @Transactional del metodo de negocio. Asi complete/release ocurren despues del
- * commit/rollback del negocio.
- */
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+/** Reserves the key, captures the HTTP result, and persists only authenticated ciphertext. */
 @WrdaIdempotency
 @Interceptor
-@Priority(Interceptor.Priority.PLATFORM_BEFORE + 100)
+@Priority(Interceptor.Priority.PLATFORM_BEFORE + 300)
 public class WrdaIdempotencyInterceptor {
+    static final String HEADER = "Idempotency-Key";
+    static final int MAX_KEY_LENGTH = 200;
+    private static final Logger LOG = Logger.getLogger(WrdaIdempotencyInterceptor.class);
 
-  static final String HEADER = "Idempotency-Key";
-  static final int MAX_KEY_LENGTH = 100;
-  private static final Logger LOG = Logger.getLogger(WrdaIdempotencyInterceptor.class);
+    private final RoutingContext routingContext;
+    private final IdempotencyService service;
+    private final ObjectMapper mapper;
+    private final ResponseEncryption encryption;
+    private final IdempotencyHmac hmac;
+    private final SecurityIdentity identity;
+    private final TransactionSynchronizationRegistry transactionRegistry;
 
-  private final RoutingContext routingContext;
-  private final IdempotencyService service;
-  private final IdempotencyReplayStrategyRegistry replayStrategies;
+    @ConfigProperty(name = "wrda.idempotency.require-authenticated-identity", defaultValue = "false")
+    boolean requireAuthenticatedIdentity;
 
-  private final ObjectMapper mapper;
+    @ConfigProperty(name = "wrda.idempotency.max-response-bytes", defaultValue = "1048576")
+    int maxResponseBytes;
 
-  @Inject
-  public WrdaIdempotencyInterceptor(RoutingContext routingContext, IdempotencyService service,
-      IdempotencyReplayStrategyRegistry replayStrategies, ObjectMapper mapper) {
-    this.routingContext = routingContext;
-    this.service = service;
-    this.replayStrategies = replayStrategies;
-    this.mapper = mapper;
-  }
+    @ConfigProperty(name = "wrda.idempotency.tenant-identity-attribute", defaultValue = "tenant_id")
+    String tenantIdentityAttribute;
 
-  private static Response.ResponseBuilder problem(int status, String code, String message) {
-    AtlasError error = new AtlasError();
-    error.setCode(code);
-    error.setMessage(message);
-    error.setCategory(AtlasError.CategoryEnum.IDEMPOTENCY);
-    return Response.status(status)
-        .type(MediaType.APPLICATION_JSON)
-        .entity(error);
-  }
-
-  // --- Ejecucion del negocio ------------------------------------------------
-
-  @AroundInvoke
-  @SuppressWarnings("unused")
-  Object around(InvocationContext ctx) throws Exception {
-    if (!Response.class.equals(ctx.getMethod().getReturnType())) {
-      throw new IllegalStateException("@WrdaIdempotency requiere que " + ctx.getMethod()
-          + " retorne jakarta.ws.rs.core.Response");
-    }
-    if (!(ctx.getTarget() instanceof IdempotencyReplayHandler)) {
-      throw new InfrastructureException("IDEMPOTENCY_REPLAY_HANDLER_REQUIRED",
-          "An @WrdaIdempotency endpoint must implement IdempotencyReplayHandler", null);
+    @Inject
+    public WrdaIdempotencyInterceptor(RoutingContext routingContext, IdempotencyService service,
+            ObjectMapper mapper, ResponseEncryption encryption, IdempotencyHmac hmac,
+            SecurityIdentity identity, TransactionSynchronizationRegistry transactionRegistry) {
+        this.routingContext = routingContext;
+        this.service = service;
+        this.mapper = mapper;
+        this.encryption = encryption;
+        this.hmac = hmac;
+        this.identity = identity;
+        this.transactionRegistry = transactionRegistry;
     }
 
-    String key = routingContext.request().getHeader(HEADER);
-    if (key == null || key.isBlank() || key.length() > MAX_KEY_LENGTH) {
-      return problem(400, "IDEMPOTENCY_KEY_REQUIRED",
-          "El header Idempotency-Key es obligatorio (maximo " + MAX_KEY_LENGTH + " caracteres)")
-          .build();
+    @AroundInvoke
+    Object around(InvocationContext context) throws Exception {
+        if (!Response.class.equals(context.getMethod().getReturnType())) {
+            return problem(500, "IDEMPOTENCY_RESPONSE_TYPE_REQUIRED",
+                    "Los endpoints idempotentes deben retornar jakarta.ws.rs.core.Response").build();
+        }
+        if (transactionRegistry.getTransactionStatus() != Status.STATUS_ACTIVE) {
+            return problem(500, "IDEMPOTENCY_TRANSACTION_REQUIRED",
+                    "El endpoint idempotente debe ejecutarse en una transacción JTA activa").build();
+        }
+        if (requireAuthenticatedIdentity && identity.isAnonymous()) {
+            return problem(401, "IDEMPOTENCY_AUTHENTICATION_REQUIRED",
+                    "La operación idempotente requiere una identidad autenticada").build();
+        }
+
+        List<String> keyValues = routingContext.request().headers().getAll(HEADER);
+        if (keyValues.size() != 1) {
+            return problem(400, "IDEMPOTENCY_KEY_REQUIRED", "Debe enviarse exactamente un header Idempotency-Key").build();
+        }
+        String rawKey = keyValues.get(0);
+        if (rawKey == null || rawKey.isBlank() || rawKey.length() > MAX_KEY_LENGTH
+                || rawKey.chars().anyMatch(Character::isISOControl)) {
+            return problem(400, "IDEMPOTENCY_KEY_INVALID", "Idempotency-Key está vacía, es demasiado larga o contiene caracteres de control").build();
+        }
+
+        String principalScope = principalScope();
+        String method = routingContext.request().method().name();
+        String path = routingContext.request().path();
+        String storedKey = hmac.idempotencyKey(principalScope, method, path, rawKey);
+        String requestHash = hmac.requestFingerprint(fingerprint(context, principalScope, method, path));
+        AcquireResult acquired = service.acquire(storedKey, requestHash);
+
+        if (acquired instanceof AcquireResult.Acquired) {
+            return execute(context, storedKey);
+        }
+        if (acquired instanceof AcquireResult.Replay replay) {
+            return replay(storedKey, replay.response());
+        }
+        if (acquired instanceof AcquireResult.InProgress) {
+            return problem(409, "REQUEST_IN_PROGRESS",
+                    "La solicitud con esta Idempotency-Key continúa en proceso o requiere recuperación operativa.")
+                    .header("Retry-After", "1").build();
+        }
+        if (acquired instanceof AcquireResult.KeyReused) {
+            return problem(422, "IDEMPOTENCY_KEY_REUSED",
+                    "Esta Idempotency-Key ya se utilizó con una solicitud distinta.").build();
+        }
+        throw new IllegalStateException("Unknown idempotency acquisition result");
     }
 
-    String requestHash = fingerprint(ctx);
-    String keyScope = routingContext.request().method().name() + "\n"
-        + routingContext.request().path() + "\n";
-    String storedKey = sha256(keyScope + key);
-    AcquireResult result = service.acquire(storedKey, requestHash);
-
-    if (result instanceof AcquireResult.Acquired) {
-      return execute(ctx, storedKey, (IdempotencyReplayHandler) ctx.getTarget());
-    }
-    if (result instanceof AcquireResult.Replay(var response)) {
-      return replay(response);
-    }
-    if (result instanceof AcquireResult.InProgress) {
-      return problem(425, "REQUEST_IN_PROGRESS",
-          "Una peticion con esta Idempotency-Key aun se esta procesando. Reintenta en unos segundos.")
-          .header("Retry-After", "1")
-          .build();
-    }
-    if (result instanceof AcquireResult.KeyReused) {
-      return problem(422, "IDEMPOTENCY_KEY_REUSED",
-          "Esta Idempotency-Key ya se uso con un request distinto.")
-          .build();
-    }
-    throw new IllegalStateException("Resultado de adquisicion de idempotencia desconocido");
-  }
-
-  private Object execute(InvocationContext ctx, String key, IdempotencyReplayHandler replayHandler)
-      throws Exception {
-    Object result;
-    try {
-      result = ctx.proceed();
-    } catch (Exception e) {
-      releaseQuietly(key); // fallo: no dejar la key bloqueando reintentos
-      throw e;
+    private Object execute(InvocationContext context, String storedKey) throws Exception {
+        try {
+            Object result = context.proceed();
+            if (result == null) {
+                service.release(storedKey);
+                return null;
+            }
+            Response response = (Response) result;
+            int status = response.getStatus();
+            if (status >= 200 && status < 300) {
+                ResponseSnapshot snapshot = ResponseSnapshot.capture(response, mapper);
+                byte[] plaintext = mapper.writeValueAsBytes(snapshot);
+                if (plaintext.length > maxResponseBytes) {
+                    throw new IllegalArgumentException("Idempotency response exceeds configured size limit");
+                }
+                String encrypted = encryption.encrypt(storedKey, plaintext);
+                // REQUIRED joins the endpoint transaction so business rows and replay commit atomically.
+                service.complete(storedKey, status, encrypted);
+            } else {
+                transactionRegistry.setRollbackOnly();
+                service.release(storedKey);
+            }
+            return result;
+        } catch (Exception | Error failure) {
+            releaseQuietly(storedKey);
+            throw failure;
+        }
     }
 
-    if (result == null) {
-      releaseQuietly(key);
-      return null;
+    private Response replay(String storedKey, AcquireResult.StoredResponse stored) {
+        if (stored.encryptedResponse() == null || stored.encryptedResponse().isBlank()) {
+            throw new IllegalStateException("Completed idempotency entry has no encrypted response");
+        }
+        try {
+            byte[] plaintext = encryption.decrypt(storedKey, stored.encryptedResponse());
+            ResponseSnapshot snapshot = mapper.readValue(plaintext, ResponseSnapshot.class);
+            if (snapshot.status() != stored.statusCode()) {
+                throw new IllegalStateException("Stored HTTP status does not match authenticated response snapshot");
+            }
+            Response original = snapshot.toResponse();
+            return Response.fromResponse(original).header("Idempotency-Replayed", "true").build();
+        } catch (Exception exception) {
+            LOG.error("Could not authenticate or reconstruct idempotency response", exception);
+            throw new IllegalStateException("Could not safely replay the stored response", exception);
+        }
     }
 
-    Response response = (Response) result;
-    int status = response.getStatus();
-    if (status == 200 || status == 201) {
-      completeQuietly(key, response, replayHandler);
-    } else {
-      releaseQuietly(key); // solo se guardan exitos
+    private String principalScope() {
+        String principal = identity.isAnonymous() || identity.getPrincipal() == null
+                ? "anonymous" : identity.getPrincipal().getName();
+        Object tenant = identity.getAttribute(tenantIdentityAttribute);
+        return tenant == null ? principal : principal + "\n" + tenant;
     }
-    return result;
-  }
 
-  private void completeQuietly(String key, Response response, IdempotencyReplayHandler replayHandler) {
-    try {
-      ReplayReference reference = replayHandler.resourceReference(response);
-      if (reference == null || reference.resourceType() == null
-          || reference.resourceType().isBlank()
-          || reference.value() == null || reference.value().isBlank()) {
-        throw new IllegalStateException(
-            "Successful @WrdaIdempotency responses must provide a resource reference");
-      }
-      service.complete(key, response.getStatus(), reference.resourceType(), reference.value());
-    } catch (Exception e) {
-      // El negocio ya hizo commit: no se le debe fallar al cliente por esto.
-      LOG.errorf(e,
-          "No se pudo guardar la referencia de replay para la key hash %s; quedara IN_PROGRESS hasta el timeout",
-          key);
+    /** Stable method/path/query and JSON-serialized endpoint arguments, excluding the key itself. */
+    private String fingerprint(InvocationContext context, String principalScope, String method, String path)
+            throws Exception {
+        Object[] parameters = context.getParameters();
+        var methodParameters = context.getMethod().getParameters();
+        List<Object> requestValues = new ArrayList<>(parameters.length);
+        for (int i = 0; i < parameters.length; i++) {
+            HeaderParam header = methodParameters[i].getAnnotation(HeaderParam.class);
+            if (header == null || !HEADER.equalsIgnoreCase(header.value())) {
+                requestValues.add(parameters[i]);
+            }
+        }
+        String query = routingContext.request().query();
+        byte[] serialized = mapper.writeValueAsBytes(requestValues);
+        return principalScope + "\n" + method + "\n" + path + "\n" + (query == null ? "" : query)
+                + "\n" + new String(serialized, StandardCharsets.UTF_8);
     }
-  }
 
-  // --- Replay ---------------------------------------------------------------
-
-  private void releaseQuietly(String key) {
-    try {
-      service.release(key);
-    } catch (Exception e) {
-      LOG.errorf(e, "No se pudo liberar la key %s; quedara IN_PROGRESS hasta el timeout", key);
+    private void releaseQuietly(String key) {
+        try {
+            service.release(key);
+        } catch (RuntimeException releaseFailure) {
+            LOG.error("Could not release idempotency reservation after failure", releaseFailure);
+        }
     }
-  }
 
-  // --- Utilidades -----------------------------------------------------------
-
-  private Response replay(AcquireResult.StoredResponse stored) {
-    if (stored.resourceType() == null || stored.resourceType().isBlank()) {
-      throw new InfrastructureException("IDEMPOTENCY_RESOURCE_TYPE_MISSING",
-          "The completed idempotency record has no resource type", null);
+    private static Response.ResponseBuilder problem(int status, String code, String message) {
+        AtlasError error = new AtlasError();
+        error.setCode(code);
+        error.setMessage(message);
+        error.setCategory(AtlasError.CategoryEnum.IDEMPOTENCY);
+        return Response.status(status).type(MediaType.APPLICATION_JSON).entity(error);
     }
-    if (stored.resourceReference() == null || stored.resourceReference().isBlank()) {
-      throw new InfrastructureException("IDEMPOTENCY_RESOURCE_REFERENCE_MISSING",
-          "The completed idempotency record has no resource reference", null);
-    }
-    try (Response resourceResponse = replayStrategies.replay(stored.resourceType(),
-        stored.resourceReference(), stored.statusCode())) {
-      return Response.fromResponse(resourceResponse)
-          .header("Idempotency-Replayed", "true")
-          .build();
-    } catch (RuntimeException exception) {
-      throw exception;
-    } catch (Exception exception) {
-      throw new InfrastructureException("IDEMPOTENCY_REPLAY_FAILURE",
-          "Could not rebuild the response from its persisted resource", exception);
-    }
-  }
-
-  /**
-   * SHA-256 de metodo HTTP + path + parametros del metodo (el body ya deserializado).
-   */
-  private String fingerprint(InvocationContext ctx)
-      throws NoSuchAlgorithmException, com.fasterxml.jackson.core.JsonProcessingException {
-    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-    digest.update((routingContext.request().method().name() + " "
-        + routingContext.request().path() + "\n").getBytes(StandardCharsets.UTF_8));
-    Object[] parameters = ctx.getParameters();
-    var methodParameters = ctx.getMethod().getParameters();
-    List<Object> requestValues = new ArrayList<>(parameters.length);
-    for (int i = 0; i < parameters.length; i++) {
-      HeaderParam headerParam = methodParameters[i].getAnnotation(HeaderParam.class);
-      if (headerParam == null || !HEADER.equals(headerParam.value())) {
-        requestValues.add(parameters[i]);
-      }
-    }
-    digest.update(mapper.writeValueAsBytes(requestValues));
-    return HexFormat.of().formatHex(digest.digest());
-  }
-
-  private static String sha256(String value) throws NoSuchAlgorithmException {
-    return HexFormat.of().formatHex(
-        MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
-  }
 }

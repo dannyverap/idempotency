@@ -11,9 +11,8 @@ import java.time.Duration;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
- * Todas las operaciones corren en su PROPIA transaccion corta (REQUIRES_NEW). Asi el IN_PROGRESS
- * queda confirmado (visible para otras peticiones) antes de ejecutar el negocio, y complete/release
- * no dependen de la transaccion del negocio.
+ * La reserva se confirma antes del negocio. La finalización se une a la transacción de negocio
+ * para que sus escrituras y el replay se confirmen o reviertan juntos.
  */
 @ApplicationScoped
 public class IdempotencyService {
@@ -27,9 +26,6 @@ public class IdempotencyService {
 
   @ConfigProperty(name = "wrda.idempotency.ttl", defaultValue = "PT24H")
   Duration ttl;
-
-  @ConfigProperty(name = "wrda.idempotency.in-progress-timeout", defaultValue = "PT30S")
-  Duration inProgressTimeout;
 
   @Transactional(Transactional.TxType.REQUIRES_NEW)
   public AcquireResult acquire(String key, String requestHash) {
@@ -45,7 +41,6 @@ public class IdempotencyService {
   private AcquireResult tryAcquire(String key, String requestHash) {
     long now = System.currentTimeMillis();
     long expiresAt = now + ttl.toMillis();
-    long staleBefore = now - inProgressTimeout.toMillis();
 
     // 1) Intento atomico de reclamar la key (primera sentencia = escritura).
     if (store.insertInProgress(key, requestHash, now, expiresAt)) {
@@ -58,29 +53,25 @@ public class IdempotencyService {
       return null; // la liberaron justo ahora: reintenta el INSERT
     }
 
-    // 3) IN_PROGRESS huerfano (el proceso murio): se puede retomar.
+    // No retomar automáticamente por antigüedad: la operación original podría seguir viva.
     if (!existing.requestHash().equals(requestHash)) {
       return new AcquireResult.KeyReused();
     }
 
-    if (existing.status() == IdempotencyStatus.IN_PROGRESS
-        && existing.updatedAt() < staleBefore) {
-      return store.takeOverStale(key, requestHash, now, expiresAt, staleBefore)
-          ? new AcquireResult.Acquired()
-          : null; // otro la retomo/cambio: reevaluar
-    }
-
-    // Terminada con exito: replay. Si no, sigue en ejecucion.
+    // Terminada con éxito: replay. IN_PROGRESS antiguo requiere recuperación operativa.
     if (existing.status() == IdempotencyStatus.COMPLETED) {
       return new AcquireResult.Replay(new AcquireResult.StoredResponse(
-          existing.statusCode(), existing.resourceType(), existing.resourceReference()));
+          existing.statusCode(), existing.encryptedResponse()));
     }
     return new AcquireResult.InProgress();
   }
 
-  @Transactional(Transactional.TxType.REQUIRES_NEW)
-  public void complete(String key, int statusCode, String resourceType, String resourceReference) {
-    store.markCompleted(key, statusCode, resourceType, resourceReference, System.currentTimeMillis());
+  @Transactional
+  public void complete(String key, int statusCode, String encryptedResponse) {
+    long now = System.currentTimeMillis();
+    if (!store.markCompleted(key, statusCode, encryptedResponse, now, now + ttl.toMillis())) {
+      throw new IllegalStateException("Idempotency reservation could not be completed");
+    }
   }
 
   @Transactional(Transactional.TxType.REQUIRES_NEW)

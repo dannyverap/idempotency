@@ -4,12 +4,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     request_hash    CHAR(64)     NOT NULL,
     status          VARCHAR(20)  NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED')),
     status_code     INTEGER,
-    resource_type   VARCHAR(100),
-    resource_reference VARCHAR(100),
+    encrypted_response CLOB,
     created_at      BIGINT       NOT NULL,
     updated_at      BIGINT       NOT NULL,
     expires_at      BIGINT       NOT NULL
 );
+-- Compatibilidad con una base H2 creada por versiones anteriores de esta demo.
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS encrypted_response CLOB;
 
 CREATE INDEX IF NOT EXISTS ix_idempotency_expires_at ON idempotency_keys (expires_at);
 

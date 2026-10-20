@@ -1,12 +1,11 @@
 package com.wrda.application.idempotency.model;
 
-/** Immutable view of a persisted idempotency key. */
+/** Immutable view of persisted idempotency state. */
 public record IdempotencyEntry(
         String requestHash,
         IdempotencyStatus status,
         Integer statusCode,
-        String resourceType,
-        String resourceReference,
+        String encryptedResponse,
         long createdAt,
         long updatedAt,
         long expiresAt) {

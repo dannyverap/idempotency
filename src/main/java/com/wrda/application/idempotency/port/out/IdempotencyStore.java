@@ -9,10 +9,8 @@ public interface IdempotencyStore {
 
     IdempotencyEntry findEntry(String key);
 
-    boolean takeOverStale(String key, String requestHash, long now, long expiresAt, long staleBefore);
-
-    boolean markCompleted(String key, int statusCode, String resourceType, String resourceReference,
-                          long now);
+    boolean markCompleted(String key, int statusCode, String encryptedResponse, long now,
+                          long expiresAt);
 
     long releaseInProgress(String key);
 

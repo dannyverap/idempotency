@@ -7,6 +7,7 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
+import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 
 @Entity
@@ -27,11 +28,9 @@ public class IdempotencyRecord extends PanacheEntityBase {
     @Column(name = "status_code")
     public Integer statusCode;
 
-    @Column(name = "resource_reference", length = 100)
-    public String resourceReference;
-
-    @Column(name = "resource_type", length = 100)
-    public String resourceType;
+    @Lob
+    @Column(name = "encrypted_response")
+    public String encryptedResponse;
 
     /** Epoch en milisegundos. */
     @Column(name = "created_at", nullable = false)

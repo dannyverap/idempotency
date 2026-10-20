@@ -12,20 +12,17 @@ import com.wrda.infrastructure.error.WrdaManagedEndpoint;
 import com.wrda.infrastructure.orders.contract.api.OrdersApi;
 import com.wrda.infrastructure.orders.contract.model.CreateOrderRequest;
 import com.wrda.infrastructure.orders.contract.model.CreateOrderPaymentRequest;
-import com.wrda.infrastructure.orders.contract.model.OrderPaymentResponse;
-import com.wrda.infrastructure.orders.contract.model.OrderResponse;
-import com.wrda.infrastructure.idempotency.http.IdempotencyReplayHandler;
-import com.wrda.infrastructure.idempotency.http.ReplayReference;
 import io.quarkus.logging.Log;
 import io.smallrye.common.annotation.Blocking;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
 import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.core.Response;
 
 import java.net.URI;
 import java.util.UUID;
 
-public class OrderResourceAdapter implements OrdersApi, IdempotencyReplayHandler {
+public class OrderResourceAdapter implements OrdersApi {
 
     private final CreateOrderService createOrderService;
     private final CreateOrderPaymentService createOrderPaymentService;
@@ -43,9 +40,10 @@ public class OrderResourceAdapter implements OrdersApi, IdempotencyReplayHandler
     @Override
     @Blocking
     @WrdaManagedEndpoint
+    @Transactional
     public Response createOrder(@HeaderParam("Idempotency-Key") String idempotencyKey,
                                 CreateOrderRequest request) {
-        Log.infof("Procesando orden (esto es lo que NO debe repetirse): %s", request);
+        Log.info("Processing idempotent order request");
         CreateOrderCommand command = new CreateOrderCommand(
                 request == null ? null : request.getCustomerId(),
                 request == null ? null : request.getAmount(),
@@ -60,9 +58,10 @@ public class OrderResourceAdapter implements OrdersApi, IdempotencyReplayHandler
     @Override
     @Blocking
     @WrdaManagedEndpoint
+    @Transactional
     public Response createOrderWithPayment(String idempotencyKey,
                                            CreateOrderPaymentRequest request) {
-        Log.infof("Procesando orden y pago: %s", request);
+        Log.info("Processing idempotent order-and-payment request");
         var command = new CreateOrderPaymentCommand(
                 request == null ? null : request.getCustomerId(),
                 request == null ? null : request.getAmount(),
@@ -83,18 +82,4 @@ public class OrderResourceAdapter implements OrdersApi, IdempotencyReplayHandler
         return Response.ok(OrderApiMapper.toOrderResponse(order)).build();
     }
 
-    @Override
-    public ReplayReference resourceReference(Response successfulResponse) {
-        Object entity = successfulResponse.getEntity();
-        if (entity instanceof OrderResponse response) {
-            return new ReplayReference("order", response.getOrderId().toString());
-        }
-        if (entity instanceof OrderPaymentResponse response
-                && response.getOrder() != null && response.getPayment() != null) {
-            return new ReplayReference("order-payment",
-                    response.getOrder().getOrderId() + ":" + response.getPayment().getPaymentId());
-        }
-        throw new InfrastructureException("UNSUPPORTED_REPLAY_RESPONSE",
-                "No replay reference extractor exists for this response type", null);
-    }
 }

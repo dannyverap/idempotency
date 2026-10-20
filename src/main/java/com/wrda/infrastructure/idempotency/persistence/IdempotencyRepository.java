@@ -48,8 +48,7 @@ public class IdempotencyRepository
       IdempotencyRecord idempotencyRecord = find("idempotencyKey", key).firstResult();
       return idempotencyRecord == null ? null
           : new IdempotencyEntry(idempotencyRecord.requestHash, idempotencyRecord.status,
-              idempotencyRecord.statusCode, idempotencyRecord.resourceType,
-              idempotencyRecord.resourceReference,
+              idempotencyRecord.statusCode, idempotencyRecord.encryptedResponse,
               idempotencyRecord.createdAt, idempotencyRecord.updatedAt,
               idempotencyRecord.expiresAt);
     });
@@ -84,30 +83,14 @@ public class IdempotencyRepository
     });
   }
 
-  /**
-   * Retoma un IN_PROGRESS huerfano (más viejo que staleBefore).
-   */
+  /** IN_PROGRESS -> COMPLETED en la misma transacción que las escrituras del negocio. */
   @Override
-  public boolean takeOverStale(String key, String requestHash, long now, long expiresAt,
-      long staleBefore) {
-    return persistence("take over stale idempotency key", () -> {
-      int rows = update("requestHash = ?1, createdAt = ?2, updatedAt = ?3, expiresAt = ?4 "
-              + "where idempotencyKey = ?5 and status = ?6 and updatedAt < ?7",
-          requestHash, now, now, expiresAt, key, IdempotencyStatus.IN_PROGRESS, staleBefore);
-      return rows == 1;
-    });
-  }
-
-  /**
-   * IN_PROGRESS -> COMPLETED guardando solo una referencia al recurso creado.
-   */
-  @Override
-  public boolean markCompleted(String key, int statusCode, String resourceType,
-      String resourceReference, long now) {
+  public boolean markCompleted(String key, int statusCode, String encryptedResponse,
+      long now, long expiresAt) {
     return persistence("complete idempotency key", () -> {
-      int rows = update("status = ?1, statusCode = ?2, resourceType = ?3, resourceReference = ?4, "
-              + "updatedAt = ?5 where idempotencyKey = ?6 and status = ?7",
-          IdempotencyStatus.COMPLETED, statusCode, resourceType, resourceReference, now,
+      int rows = update("status = ?1, statusCode = ?2, encryptedResponse = ?3, "
+              + "updatedAt = ?4, expiresAt = ?5 where idempotencyKey = ?6 and status = ?7",
+          IdempotencyStatus.COMPLETED, statusCode, encryptedResponse, now, expiresAt,
           key, IdempotencyStatus.IN_PROGRESS);
       return rows == 1;
     });
@@ -124,7 +107,8 @@ public class IdempotencyRepository
 
   @Override
   public long deleteExpired(long now) {
-    return persistence("delete expired idempotency keys", () -> delete("expiresAt < ?1", now));
+    return persistence("delete expired idempotency keys", () ->
+        delete("status = ?1 and expiresAt < ?2", IdempotencyStatus.COMPLETED, now));
   }
 
   private <T> T persistence(String operation, Supplier<T> action) {
