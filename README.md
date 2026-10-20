@@ -56,7 +56,26 @@ La reserva se confirma en una transacción corta antes del negocio. En contraste
 - `infrastructure/idempotency/persistence`: Panache, SQL y limpieza de claves COMPLETED vencidas.
 - `infrastructure/orders`: ejemplo HTTP y persistencia del dominio.
 
-La implementación actual de reclamo atómico usa `MERGE ... WHEN NOT MATCHED`, propia de H2 en esta demo. Antes de integrar otro motor SQL, implementar y probar el puerto `IdempotencyStore` con la primitiva atómica adecuada a ese motor, revisar aislamiento/bloqueos y reemplazar el DDL de H2 por migraciones versionadas (por ejemplo, Flyway/Liquibase). No ejecutar este esquema `schema.sql` sin adaptación contra la base de datos bancaria.
+### H2 local y SQL Server
+
+H2 permanece como configuración predeterminada para pruebas y desarrollo local (`mvn quarkus:dev`). Se agregó la extensión JDBC de SQL Server, un perfil `sqlserver`, un DDL específico (`schema-sqlserver.sql`) y una sentencia de reserva específica para SQL Server. En SQL Server la reclamación usa `MERGE ... WITH (HOLDLOCK)` junto con la clave primaria única; `HOLDLOCK` aplica semántica SERIALIZABLE sobre el rango de clave durante esa sentencia. La sentencia debe someterse a pruebas de concurrencia con la versión y configuración exacta de SQL Server antes de producción; Microsoft advierte probar cuidadosamente `MERGE` bajo carga concurrente.
+
+Para ejecutar localmente apuntando a SQL Server:
+
+```bash
+export SQLSERVER_USERNAME='...'
+export SQLSERVER_PASSWORD='...'
+export SQLSERVER_JDBC_URL='jdbc:sqlserver://localhost:1433;databaseName=idempotency;encrypt=true;trustServerCertificate=true'
+export WRDA_IDEMPOTENCY_ENCRYPTION_KEYS="v1:$(openssl rand -base64 32 | tr -d '\n')"
+export WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID=v1
+export WRDA_IDEMPOTENCY_HMAC_KEY="$(openssl rand -base64 32 | tr -d '\n')"
+export WRDA_IDEMPOTENCY_REQUIRE_AUTHENTICATED_IDENTITY=false
+mvn quarkus:dev -Dquarkus.profile=sqlserver
+```
+
+El perfil SQL Server selecciona `db-kind=mssql` y usa `dbo` en el DDL y en la reserva atómica; el usuario de conexión debe tener `dbo` como esquema por defecto o recibir permisos explícitos sobre `dbo`. El URL de ejemplo confía en el certificado del servidor para facilitar un SQL Server local; en entornos compartidos/producción configurar TLS validando certificado y hostname, sin `trustServerCertificate=true`. Crear la base de datos y conceder permisos con el proceso aprobado antes de iniciar la aplicación.
+
+El inicializador de esquema sirve para la demo/local y crea objetos faltantes; no reemplaza un sistema de migraciones. En producción, usar migraciones SQL Server versionadas/aprobadas (Flyway, Liquibase o la herramienta institucional), deshabilitar el DDL de arranque si así se requiere, y revisar constraints, índices, nombres/esquemas, permisos y ventana de despliegue. Este repo no ejecutó integración contra una instancia SQL Server: las pruebas automatizadas actuales corren sobre H2. Antes de habilitar tráfico real, validar el DDL, la compatibilidad de `NVARCHAR(MAX)` con el mapeo JPA, el conteo de filas afectadas por `MERGE`, bloqueos/deadlocks, reintentos por deadlock/transient failure y benchmarks en la versión y nivel de aislamiento objetivo.
 
 ## Ejecución y comprobación manual
 

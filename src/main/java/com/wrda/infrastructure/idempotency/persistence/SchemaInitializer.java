@@ -5,6 +5,7 @@ import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -20,6 +21,9 @@ public class SchemaInitializer {
 
     private static final Logger LOG = Logger.getLogger(SchemaInitializer.class);
 
+    @ConfigProperty(name = "wrda.idempotency.schema-resource", defaultValue = "/db/schema.sql")
+    String schemaResource;
+
     private final AgroalDataSource dataSource;
 
     @Inject
@@ -29,9 +33,9 @@ public class SchemaInitializer {
 
     void onStart(@Observes StartupEvent event) throws IOException, SQLException {
         String ddl;
-        try (InputStream in = getClass().getResourceAsStream("/db/schema.sql")) {
+        try (InputStream in = getClass().getResourceAsStream(schemaResource)) {
             if (in == null) {
-                throw new IllegalStateException("No se encontro /db/schema.sql en el classpath");
+                throw new IllegalStateException("No se encontro " + schemaResource + " en el classpath");
             }
             ddl = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
@@ -44,6 +48,6 @@ public class SchemaInitializer {
                 }
             }
         }
-        LOG.info("Esquema de idempotencia listo (tabla idempotency_keys)");
+        LOG.infof("Esquema de base de datos listo desde %s", schemaResource);
     }
 }

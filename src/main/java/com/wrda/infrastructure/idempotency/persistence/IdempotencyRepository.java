@@ -6,14 +6,15 @@ import com.wrda.application.idempotency.port.out.IdempotencyStore;
 import com.wrda.infrastructure.error.InfrastructureException;
 import io.quarkus.hibernate.orm.panache.PanacheRepositoryBase;
 import jakarta.enterprise.context.ApplicationScoped;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import java.util.function.Supplier;
 import org.hibernate.Session;
 
 /**
  * Cada metodo es UNA sentencia SQL atomica. Se evita a proposito el patron "consultar y luego
- * insertar" y las excepciones por PK duplicada (dejarian la transaccion en rollback-only). H2
- * ignora el conflicto de PK con MERGE WHEN NOT MATCHED, manteniendo la reclamacion atomica sin
- * cambiar una key existente.
+ * insertar" y las excepciones por PK duplicada (dejarian la transaccion en rollback-only). Cada
+ * motor usa su sentencia nativa. En SQL Server el MERGE lleva HOLDLOCK para serializar la búsqueda
+ * de la clave ausente y la inserción bajo el índice único.
  */
 @ApplicationScoped
 public class IdempotencyRepository
@@ -41,6 +42,20 @@ public class IdempotencyRepository
           + "INSERT (idempotency_key, request_hash, status, created_at, updated_at, expires_at) "
           + "VALUES (new_key.idempotency_key, new_key.request_hash, new_key.status, "
           + "new_key.created_at, new_key.updated_at, new_key.expires_at)";
+
+  private static final String INSERT_IN_PROGRESS_SQLSERVER =
+      "MERGE INTO dbo.idempotency_keys WITH (HOLDLOCK) AS target "
+          + "USING (VALUES (CAST(?1 AS CHAR(64)), CAST(?2 AS CHAR(64)), "
+          + "CAST(?3 AS BIGINT), CAST(?4 AS BIGINT), CAST(?5 AS BIGINT))) "
+          + "AS source(idempotency_key, request_hash, created_at, updated_at, expires_at) "
+          + "ON target.idempotency_key = source.idempotency_key "
+          + "WHEN NOT MATCHED BY TARGET THEN INSERT "
+          + "(idempotency_key, request_hash, status, created_at, updated_at, expires_at) "
+          + "VALUES (source.idempotency_key, source.request_hash, 'IN_PROGRESS', "
+          + "source.created_at, source.updated_at, source.expires_at)";
+
+  @ConfigProperty(name = "quarkus.datasource.db-kind", defaultValue = "h2")
+  String databaseKind;
 
   @Override
   public IdempotencyEntry findEntry(String key) {
@@ -72,7 +87,8 @@ public class IdempotencyRepository
   public boolean insertInProgress(String key, String requestHash, long now, long expiresAt) {
     return persistence("claim idempotency key", () -> {
       int rows = getEntityManager().unwrap(Session.class)
-          .createNativeMutationQuery(INSERT_IN_PROGRESS_SQL)
+          .createNativeMutationQuery("mssql".equalsIgnoreCase(databaseKind)
+              ? INSERT_IN_PROGRESS_SQLSERVER : INSERT_IN_PROGRESS_SQL)
           .setParameter(1, key)
           .setParameter(2, requestHash)
           .setParameter(3, now)
