@@ -6,7 +6,7 @@ public sealed interface AcquireResult {
     /** Eres el primero: ejecuta la logica de negocio. */
     record Acquired() implements AcquireResult {}
 
-    /** La key ya termino con exito: devuelve la instantanea cifrada que se guardo. */
+    /** La key ya termino con exito: devuelve el snapshot HTTP persistido. */
     record Replay(StoredResponse response) implements AcquireResult {}
 
     /** Otra peticion con la misma key sigue ejecutandose. */
@@ -15,6 +15,6 @@ public sealed interface AcquireResult {
     /** La key ya se uso con un request distinto. */
     record KeyReused() implements AcquireResult {}
 
-    /** Instantánea HTTP cifrada; nunca contiene datos en claro en el modelo de aplicación. */
-    record StoredResponse(int statusCode, String encryptedResponse) {}
+    /** Snapshot HTTP para reproducción; el control de confidencialidad en reposo corresponde a la base de datos. */
+    record StoredResponse(int statusCode, String responseSnapshot) {}
 }

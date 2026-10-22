@@ -6,13 +6,15 @@ BEGIN
         request_hash CHAR(64) NOT NULL,
         status VARCHAR(20) NOT NULL,
         status_code INT NULL,
-        encrypted_response NVARCHAR(MAX) NULL,
+        response_snapshot NVARCHAR(MAX) NULL,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         expires_at BIGINT NOT NULL,
         CONSTRAINT ck_idempotency_keys_status CHECK (status IN ('IN_PROGRESS', 'COMPLETED'))
     )
 END
+IF COL_LENGTH(N'dbo.idempotency_keys', N'response_snapshot') IS NULL
+    ALTER TABLE dbo.idempotency_keys ADD response_snapshot NVARCHAR(MAX) NULL
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_idempotency_status_expires' AND object_id = OBJECT_ID(N'dbo.idempotency_keys'))
     CREATE INDEX ix_idempotency_status_expires ON dbo.idempotency_keys (status, expires_at)
 IF OBJECT_ID(N'dbo.orders', N'U') IS NULL

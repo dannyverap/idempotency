@@ -5,7 +5,7 @@ public record IdempotencyEntry(
         String requestHash,
         IdempotencyStatus status,
         Integer statusCode,
-        String encryptedResponse,
+        String responseSnapshot,
         long createdAt,
         long updatedAt,
         long expiresAt) {

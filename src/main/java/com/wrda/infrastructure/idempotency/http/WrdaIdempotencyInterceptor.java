@@ -79,7 +79,7 @@ public class WrdaIdempotencyInterceptor {
             return responseHandler.execute(invocation, storageKey);
         }
         if (acquisition instanceof AcquireResult.Replay replay) {
-            return responseHandler.replay(storageKey, replay.response());
+            return responseHandler.replay(replay.response());
         }
         if (acquisition instanceof AcquireResult.InProgress) {
             return IdempotencyProblemResponse.create(409, "REQUEST_IN_PROGRESS",

@@ -61,15 +61,15 @@ public class IdempotencyService {
     // Terminada con éxito: replay. IN_PROGRESS antiguo requiere recuperación operativa.
     if (existing.status() == IdempotencyStatus.COMPLETED) {
       return new AcquireResult.Replay(new AcquireResult.StoredResponse(
-          existing.statusCode(), existing.encryptedResponse()));
+          existing.statusCode(), existing.responseSnapshot()));
     }
     return new AcquireResult.InProgress();
   }
 
   @Transactional
-  public void complete(String key, int statusCode, String encryptedResponse) {
+  public void complete(String key, int statusCode, String responseSnapshot) {
     long now = System.currentTimeMillis();
-    if (!store.markCompleted(key, statusCode, encryptedResponse, now, now + ttl.toMillis())) {
+    if (!store.markCompleted(key, statusCode, responseSnapshot, now, now + ttl.toMillis())) {
       throw new IllegalStateException("Idempotency reservation could not be completed");
     }
   }

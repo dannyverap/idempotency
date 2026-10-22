@@ -3,24 +3,21 @@ package com.wrda.infrastructure.idempotency.http;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wrda.application.idempotency.IdempotencyService;
 import com.wrda.application.idempotency.model.AcquireResult;
-import com.wrda.infrastructure.idempotency.security.ResponseEncryption;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.interceptor.InvocationContext;
-import jakarta.transaction.Status;
 import jakarta.transaction.TransactionSynchronizationRegistry;
 import jakarta.ws.rs.core.Response;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
-/** Owns the lifecycle of successful response snapshots and safe replay reconstruction. */
+/** Executes successful endpoints once and stores/reconstructs their HTTP response snapshot. */
 @ApplicationScoped
 public class IdempotencyResponseHandler {
     private static final Logger LOG = Logger.getLogger(IdempotencyResponseHandler.class);
 
     private final IdempotencyService service;
     private final ObjectMapper mapper;
-    private final ResponseEncryption encryption;
     private final TransactionSynchronizationRegistry transactionRegistry;
 
     @ConfigProperty(name = "wrda.idempotency.max-response-bytes", defaultValue = "1048576")
@@ -28,10 +25,9 @@ public class IdempotencyResponseHandler {
 
     @Inject
     public IdempotencyResponseHandler(IdempotencyService service, ObjectMapper mapper,
-            ResponseEncryption encryption, TransactionSynchronizationRegistry transactionRegistry) {
+            TransactionSynchronizationRegistry transactionRegistry) {
         this.service = service;
         this.mapper = mapper;
-        this.encryption = encryption;
         this.transactionRegistry = transactionRegistry;
     }
 
@@ -58,34 +54,32 @@ public class IdempotencyResponseHandler {
         }
     }
 
-    public Response replay(String storageKey, AcquireResult.StoredResponse stored) {
-        if (stored.encryptedResponse() == null || stored.encryptedResponse().isBlank()) {
-            throw new IllegalStateException("Completed idempotency entry has no encrypted response");
+    public Response replay(AcquireResult.StoredResponse stored) {
+        if (stored.responseSnapshot() == null || stored.responseSnapshot().isBlank()) {
+            throw new IllegalStateException("Completed idempotency entry has no response snapshot");
         }
         try {
-            byte[] plaintext = encryption.decrypt(storageKey, stored.encryptedResponse());
-            ResponseSnapshot snapshot = mapper.readValue(plaintext, ResponseSnapshot.class);
+            ResponseSnapshot snapshot = mapper.readValue(stored.responseSnapshot(), ResponseSnapshot.class);
             if (snapshot.status() != stored.statusCode()) {
-                throw new IllegalStateException(
-                        "Stored HTTP status does not match authenticated response snapshot");
+                throw new IllegalStateException("Stored HTTP status does not match response snapshot");
             }
             Response original = snapshot.toResponse();
             return Response.fromResponse(original).header("Idempotency-Replayed", "true").build();
         } catch (Exception exception) {
-            LOG.error("Could not authenticate or reconstruct idempotency response", exception);
+            LOG.error("Could not deserialize or reconstruct idempotency response snapshot", exception);
             throw new IllegalStateException("Could not safely replay the stored response", exception);
         }
     }
 
     private void storeSuccessfulResponse(String storageKey, Response response, int status) throws Exception {
         ResponseSnapshot snapshot = ResponseSnapshot.capture(response, mapper);
-        byte[] plaintext = mapper.writeValueAsBytes(snapshot);
-        if (plaintext.length > maxResponseBytes) {
+        String serializedSnapshot = mapper.writeValueAsString(snapshot);
+        int serializedBytes = serializedSnapshot.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (serializedBytes > maxResponseBytes) {
             throw new IllegalArgumentException("Idempotency response exceeds configured size limit");
         }
-        String encrypted = encryption.encrypt(storageKey, plaintext);
-        // REQUIRED joins the endpoint transaction so business rows and replay commit atomically.
-        service.complete(storageKey, status, encrypted);
+        // REQUIRED joins the endpoint transaction so business rows and the snapshot commit atomically.
+        service.complete(storageKey, status, serializedSnapshot);
     }
 
     private void releaseQuietly(String storageKey) {

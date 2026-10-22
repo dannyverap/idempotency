@@ -29,8 +29,8 @@ public class IdempotencyRecord extends PanacheEntityBase {
     public Integer statusCode;
 
     @Lob
-    @Column(name = "encrypted_response")
-    public String encryptedResponse;
+    @Column(name = "response_snapshot")
+    public String responseSnapshot;
 
     /** Epoch en milisegundos. */
     @Column(name = "created_at", nullable = false)

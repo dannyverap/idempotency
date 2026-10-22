@@ -4,7 +4,7 @@ Demo de idempotencia HTTP para Quarkus 3.33 y Java 21. Usa CDI, Hibernate ORM/Pa
 
 ## Qué garantiza
 
-`@WrdaManagedEndpoint` combina el manejo de errores con `@WrdaIdempotency`. El interceptor reclama una clave antes de ejecutar el endpoint. Tras una respuesta 2xx, persiste una instantánea HTTP cifrada con AES-256-GCM en la tabla `idempotency_keys`. Un reintento con la misma clave, identidad y petición devuelve el mismo status, cuerpo y encabezados de respuesta permitidos, sin ejecutar de nuevo el código de negocio ni volver a leer tablas de dominio.
+`@WrdaManagedEndpoint` combina el manejo de errores con `@WrdaIdempotency`. El interceptor reclama una clave antes de ejecutar el endpoint. Tras una respuesta 2xx, persiste el snapshot HTTP como JSON en `response_snapshot` dentro de `idempotency_keys`, sin cifrado de respuesta a nivel de aplicación. Un reintento con la misma clave, identidad y petición devuelve el mismo status, cuerpo y encabezados permitidos sin repetir el negocio ni volver a leer tablas de dominio.
 
 Esto también funciona si la respuesta representa varias tablas. Por ejemplo, `POST /api/orders/with-payment` crea una orden y un pago, pero el replay no tiene que descubrir ni consultar esas tablas: recupera la instantánea original. La reserva `IN_PROGRESS`, los cambios de negocio y el estado `COMPLETED` se coordinan en la misma base. Los endpoints de escritura tienen `@Transactional`; el interceptor verifica que exista una transacción JTA activa y el guardado de `COMPLETED` se une a ella. Si la transacción falla, tanto el cambio de negocio como la instantánea se revierten.
 
@@ -12,20 +12,14 @@ La tabla no almacena la clave del cliente en claro. La clave y la huella de la s
 
 ## Protección de datos y secretos
 
-La instantánea completa —status, cuerpo y encabezados seleccionados— se cifra con AES-256-GCM. El identificador derivado de la clave se usa como AAD para impedir que el ciphertext se mueva a otro registro sin ser detectado. El cuerpo máximo es 1 MiB por defecto. Solo se aceptan respuestas JSON y texto no streaming. Se guardan encabezados permitidos (`Location`, `Cache-Control`, `ETag`, `Last-Modified`, `Expires`, `Content-Language` y `Vary`); no se guardan `Set-Cookie`, `Authorization` ni encabezados arbitrarios.
+La instantánea —status, cuerpo y encabezados seleccionados— se serializa como JSON y se persiste sin cifrado de aplicación en `response_snapshot`. La protección de confidencialidad en reposo se delega a la base de datos y a la configuración aprobada (por ejemplo, TDE en SQL Server); este repositorio no habilita ni configura TDE. Un usuario con permisos de lectura sobre la tabla puede ver el snapshot, y el cifrado en reposo no reemplaza TLS, control de acceso, cifrado/gestión de backups ni controles de aplicación. El tamaño máximo serializado es 1 MiB por defecto. Solo se aceptan respuestas JSON y texto no streaming. Se guardan encabezados permitidos (`Location`, `Cache-Control`, `ETag`, `Last-Modified`, `Expires`, `Content-Language` y `Vary`); no se guardan `Set-Cookie`, `Authorization` ni encabezados arbitrarios.
 
-Las claves no están en el repositorio. El runtime requiere estas variables, que en producción deben venir del secret manager aprobado:
-
-- `WRDA_IDEMPOTENCY_ENCRYPTION_KEYS`: key ring en formato `id:base64,id-antigua:base64`.
-- `WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID`: ID usado para cifrar escrituras nuevas.
-- `WRDA_IDEMPOTENCY_HMAC_KEY`: secreto Base64 de al menos 32 bytes para la clave derivada y la huella.
+La clave HMAC no está en el repositorio. El runtime requiere `WRDA_IDEMPOTENCY_HMAC_KEY`, un secreto Base64 de al menos 32 bytes para derivar la clave persistida y la huella; en producción debe venir del secret manager aprobado. No se requieren claves de cifrado de respuesta de la aplicación.
 - `WRDA_IDEMPOTENCY_REQUIRE_AUTHENTICATED_IDENTITY`: activar `true` en producción.
 
 Generación local de secretos efímeros (no reutilizar en despliegues):
 
 ```bash
-export WRDA_IDEMPOTENCY_ENCRYPTION_KEYS="v1:$(openssl rand -base64 32 | tr -d '\n')"
-export WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID=v1
 export WRDA_IDEMPOTENCY_HMAC_KEY="$(openssl rand -base64 32 | tr -d '\n')"
 export WRDA_IDEMPOTENCY_REQUIRE_AUTHENTICATED_IDENTITY=false
 mvn quarkus:dev
@@ -33,11 +27,11 @@ mvn quarkus:dev
 
 La identidad autenticada se incorpora al ámbito. Si existe el atributo `tenant_id` en `SecurityIdentity`, también se incorpora. El valor de `require-authenticated-identity` queda desactivado por defecto para que la demo local sin proveedor de autenticación funcione. En un despliegue bancario debe activarse, integrar el proveedor de identidad real y verificar que la identidad/tenant representan al cliente correcto. No se debe usar un header controlado por el usuario como ámbito de tenant.
 
-La rotación de cifrado es por ID: se puede cifrar con una clave nueva y mantener las claves antiguas en el key ring hasta que venzan todos los registros cifrados con ellas. No quitar una clave histórica antes de expirar/retirar los registros correspondientes. El secreto HMAC debe permanecer estable durante la vida máxima de las claves guardadas; reemplazarlo sin una migración coordinada hace que las claves existentes ya no sean localizables y puede permitir repetir operaciones. La rotación HMAC requiere un procedimiento separado y validado.
+El secreto HMAC debe permanecer estable durante la vida máxima de las claves guardadas; reemplazarlo sin una migración coordinada hace que los identificadores existentes dejen de ser localizables. La rotación HMAC requiere un procedimiento separado y validado. No hay claves de cifrado de respuesta administradas por la aplicación.
 
-Esta versión también cambia la derivación de claves anteriores de SHA-256 sin clave a HMAC y reemplaza referencias de recursos por snapshots cifrados. Las filas COMPLETED creadas por la versión anterior no contienen un snapshot descifrable, y sus hashes no coinciden con el formato nuevo. Antes de actualizar un entorno con datos persistidos, drenar las operaciones en curso y esperar el TTL anterior o ejecutar una migración/corte aprobado que garantice que un reintento antiguo no vuelva a ejecutar negocio. No desplegar directamente sobre claves aún vigentes sin resolver esa compatibilidad.
+Esta versión cambia el almacenamiento de `encrypted_response` (cifrado por la aplicación) a `response_snapshot` (JSON legible por la aplicación). El DDL conserva la columna legacy, pero el código nuevo no la lee ni la descifra. Los registros COMPLETED previos no tendrán `response_snapshot`; sus reintentos fallarán cerrados y no volverán a ejecutar el negocio. Antes de desplegar, definir una ventana de transición: conservar filas anteriores hasta que expiren y aceptar que sus reintentos no podrán replayarse, o convertirlas controladamente mientras aún se disponga de la versión y claves antiguas. No borrar a ciegas filas vigentes.
 
-El cifrado de aplicación no sustituye el cifrado de disco/base de datos, TLS, control de acceso, auditoría, backups cifrados, retención ni clasificación de datos del banco. La instantánea puede incluir información sensible de la respuesta: aplicar permisos mínimos a la tabla y backups, revisar qué APIs son elegibles, reducir el TTL al mínimo aprobado y no almacenar tokens/cookies en el cuerpo.
+La base debe tener habilitado y validado el cifrado en reposo requerido por el banco (p. ej. TDE en SQL Server); esta demo no lo configura. El cifrado en reposo no cifra las lecturas entregadas a sesiones autorizadas ni sustituye TLS, control de acceso, auditoría, backups cifrados, retención ni clasificación de datos del banco. La instantánea puede incluir información sensible de la respuesta: aplicar permisos mínimos a la tabla y backups, revisar qué APIs son elegibles, reducir el TTL al mínimo aprobado y no almacenar tokens/cookies en el cuerpo.
 
 ## Fallos y recuperación operativa
 
@@ -52,7 +46,7 @@ La reserva se confirma en una transacción corta antes del negocio. En contraste
 - `domain`: entidades/validaciones de negocio, sin dependencias de idempotencia ni eventos concretos.
 - `application/idempotency`: servicio de aplicación y puerto `IdempotencyStore`.
 - `infrastructure/idempotency/http`: anotación CDI y componentes HTTP separados para validar la clave, construir la huella, resolver el ámbito de identidad, generar errores y capturar/reproducir respuestas.
-- `infrastructure/idempotency/security`: HMAC y cifrado AES-GCM.
+- `infrastructure/idempotency/security`: HMAC para pseudonimizar clave y huella; la respuesta no se cifra en la aplicación.
 - `infrastructure/idempotency/persistence`: Panache, SQL y limpieza de claves COMPLETED vencidas.
 - `infrastructure/orders`: ejemplo HTTP y persistencia del dominio.
 
@@ -66,8 +60,6 @@ Para ejecutar localmente apuntando a SQL Server:
 export SQLSERVER_USERNAME='...'
 export SQLSERVER_PASSWORD='...'
 export SQLSERVER_JDBC_URL='jdbc:sqlserver://localhost:1433;databaseName=idempotency;encrypt=true;trustServerCertificate=true'
-export WRDA_IDEMPOTENCY_ENCRYPTION_KEYS="v1:$(openssl rand -base64 32 | tr -d '\n')"
-export WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID=v1
 export WRDA_IDEMPOTENCY_HMAC_KEY="$(openssl rand -base64 32 | tr -d '\n')"
 export WRDA_IDEMPOTENCY_REQUIRE_AUTHENTICATED_IDENTITY=false
 mvn quarkus:dev -Dquarkus.profile=sqlserver
@@ -95,7 +87,7 @@ curl -i -X POST http://localhost:8080/api/orders \
 
 Repetir exactamente esa llamada devuelve la misma respuesta con `Idempotency-Replayed: true`. Cambiar el payload y conservar la clave devuelve `422`. Mientras la primera llamada esté activa, una petición simultánea devuelve `409`. La ruta `POST /api/orders/with-payment` prueba replay de respuesta compuesta.
 
-Las pruebas de integración en `src/test` cubren replay byte-a-byte, rechazo de payload distinto, concurrencia, liberación luego de una falla y replay de orden+pago. `IdempotencyKeyValidatorTest` cubre headers ausentes/duplicados y claves inválidas. Los secretos deterministas de `src/test/resources/application.properties` son únicamente para las pruebas automatizadas.
+Las pruebas de integración en `src/test` cubren replay byte-a-byte, rechazo de payload distinto, concurrencia, liberación luego de una falla, replay de orden+pago y que `response_snapshot` se persista como JSON sin cifrado de aplicación. `IdempotencyKeyValidatorTest` cubre headers ausentes/duplicados y claves inválidas. El secreto HMAC determinista de `src/test/resources/application.properties` es únicamente para las pruebas automatizadas.
 
 ### Ruta de lectura del interceptor
 
@@ -104,7 +96,7 @@ Las pruebas de integración en `src/test` cubren replay byte-a-byte, rechazo de 
 3. `IdempotencyKeyValidator` valida el header, y `IdempotencyRequestIdentityResolver` obtiene el ámbito principal/tenant y deriva identificadores HMAC.
 4. `RequestFingerprintBuilder` serializa método, ruta, query y argumentos HTTP excluyendo el parámetro `Idempotency-Key`.
 5. `IdempotencyService` adquiere la reserva y decide entre continuar, replay, conflicto o reutilización de clave.
-6. `IdempotencyResponseHandler` ejecuta el endpoint una sola vez, captura/cifra el resultado exitoso o descifra y reconstruye el replay. `ResponseSnapshot` define qué cuerpo y encabezados se conservan.
+6. `IdempotencyResponseHandler` ejecuta el endpoint una sola vez, serializa el snapshot JSON en `response_snapshot` y reconstruye el replay. No cifra ni descifra la respuesta en la aplicación. `ResponseSnapshot` define qué cuerpo y encabezados se conservan.
 
 ## Alcance de producción
 
@@ -130,7 +122,7 @@ flowchart LR
     U --> D[Dominio agnóstico]
     U --> B[(orders / payments)]
     K -->|COMPLETED| X
-    X -->|snapshot autenticado y descifrado| C
+    X -->|snapshot persistido, reconstruido| C
     U -. sin integración de eventos .-> E[No hay KafkaEvent ni broker en esta demo]
 ```
 
@@ -138,9 +130,9 @@ flowchart LR
 |---|---|---|
 | Clave cliente | Se envía una por operación lógica y se conserva al reintentar. | Header `Idempotency-Key`. |
 | Clave persistida | Scope por principal/tenant, método y path; valor derivado, no la clave cliente en claro. | HMAC-SHA-256 (`IdempotencyHmac`). |
-| Huella (fingerprint) | Permite distinguir repetición igual de reutilización incompatible. Considera scope, método, path, query y parámetros endpoint serializados. | `WrdaIdempotencyInterceptor.fingerprint`. |
+| Huella (fingerprint) | Permite distinguir repetición igual de reutilización incompatible. Considera scope, método, path, query y parámetros endpoint serializados. | `RequestFingerprintBuilder`. |
 | Reserva | Exclusión atómica para una petición que todavía no terminó. | Estado `IN_PROGRESS`; `MERGE` nativo. |
-| Resultado | Status + body + lista limitada de headers, en snapshot cifrado. | Estado `COMPLETED`; AES-256-GCM. |
+| Resultado | Status + body + lista limitada de headers en `response_snapshot`. | Estado `COMPLETED`; protección en reposo delegada a la base. |
 | Puerto | Interfaz que expresa operaciones necesarias sin imponer base/proveedor. | `IdempotencyStore`. |
 | Adaptador | Implementación concreta en el borde del sistema. | CDI/JAX-RS, Panache/SQL, H2 o SQL Server. |
 
@@ -181,8 +173,8 @@ sequenceDiagram
     I->>U: ejecutar negocio
     U->>DB: persistir orden/pago
     U-->>I: Response 2xx
-    I->>I: capturar snapshot y cifrarlo
-    I->>A: complete(status, ciphertext)
+    I->>I: capturar y serializar snapshot JSON
+    I->>A: complete(status, responseSnapshot)
     A->>DB: IN_PROGRESS a COMPLETED en tx negocio
     I-->>C: respuesta original
 
@@ -190,9 +182,9 @@ sequenceDiagram
     H->>I: segunda invocación
     I->>A: acquire(misma key, misma huella)
     A->>DB: consultar estado existente
-    DB-->>A: COMPLETED + ciphertext
+    DB-->>A: COMPLETED + response_snapshot JSON
     A-->>I: Replay
-    I->>I: validar tag AES-GCM y reconstruir respuesta
+    I->>I: deserializar snapshot y reconstruir respuesta
     I-->>C: mismo status/body + Idempotency-Replayed: true
 ```
 
@@ -211,7 +203,7 @@ src/main/java/com/wrda/
     ├── idempotency/
     │   ├── http/                   # Binding, interceptor, snapshot HTTP
     │   ├── persistence/             # Panache, SQL, schema init y cleanup
-    │   └── security/                # HMAC y cifrado AES-GCM
+    │   └── security/                # HMAC de clave y fingerprint
     └── orders/
         ├── http/                   # Adaptadores JAX-RS y mapeadores
         └── persistence/             # Entidades/repositorios de órdenes/pagos
@@ -228,7 +220,7 @@ pom.xml
 |---|---|---|
 | Dominio | Reglas de orden/pago y conceptos de negocio. | JAX-RS, Panache, H2, SQL Server, Kafka o formato de respuesta HTTP. |
 | Aplicación | Casos de uso y puertos de salida. | Clases concretas del driver/ORM o detalles del broker. |
-| Infraestructura | Protocolo HTTP, CDI, SQL, criptografía, proveedor de base. | Convertir esos detalles en dependencias del dominio. |
+| Infraestructura | Protocolo HTTP, CDI, SQL, HMAC y proveedor de base. | Convertir esos detalles en dependencias del dominio. |
 
 No se implementan eventos en este repo. Si se agregan, mantener un evento/intención agnóstico en las capas internas y traducirlo a Kafka u otro transporte solo en infraestructura. Una transacción de base local no hace atómica la publicación en un broker; para ese objetivo se requiere diseñar outbox/consumo idempotente según el caso.
 
@@ -236,11 +228,11 @@ No se implementan eventos en este repo. Si se agregan, mantener un evento/intenc
 
 | Tabla | Uso | Columnas principales |
 |---|---|---|
-| `idempotency_keys` | Estado por clave opaca y snapshot reutilizable. | `idempotency_key` (HMAC PK), `request_hash` (HMAC), `status`, `status_code`, `encrypted_response`, `created_at`, `updated_at`, `expires_at` (epoch ms). |
+| `idempotency_keys` | Estado por clave opaca y snapshot reutilizable. | `idempotency_key` (HMAC PK), `request_hash` (HMAC), `status`, `status_code`, `response_snapshot`, `created_at`, `updated_at`, `expires_at` (epoch ms). |
 | `orders` | Efecto de negocio de la demo. | `order_id`, `customer_id`, `amount`, `status`, `created_at`. |
 | `payments` | Segundo efecto de negocio; relación con orden. | `payment_id`, `order_id` (FK), `amount`, `status`, `created_at`. |
 
-El replay se obtiene de `encrypted_response`, no de volver a leer `orders`/`payments`. Esto permite reproducir exactamente el resultado de la operación compuesta. `ResponseSnapshot` guarda solo status, media type, body y headers permitidos; no pretende reproducir todos los headers de transporte.
+El replay se obtiene de `response_snapshot`, no de volver a leer `orders`/`payments`. Esto permite reproducir la respuesta de la operación compuesta. El contenido se guarda en claro para la aplicación; protecciones de base, acceso y retención deben alinearse con la clasificación bancaria. `ResponseSnapshot` conserva status, media type, body y headers permitidos, no todos los headers de transporte.
 
 ## Endpoints consumidos por la demo
 
@@ -265,8 +257,6 @@ Para iniciar la aplicación local, exporta secretos efímeros (solo para desarro
 
 ```bash
 export WRDA_IDEMPOTENCY_HMAC_KEY="$(openssl rand -base64 32)"
-export WRDA_IDEMPOTENCY_ENCRYPTION_KEYS="v1:$(openssl rand -base64 32)"
-export WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID=v1
 mvn quarkus:dev
 ```
 
@@ -352,17 +342,15 @@ Una repetición que alcance al primer request mientras este sigue en ejecución 
 | `quarkus.datasource.*` | H2 `mem:idempotency` | Base por defecto de demo/desarrollo; volátil al reiniciar. |
 | `wrda.idempotency.ttl` | `PT24H` | Ventana de retención/replay de entradas `COMPLETED`. |
 | `WRDA_IDEMPOTENCY_HMAC_KEY` | Base64, mínimo 32 bytes | Secreto común y estable para derivar claves y huellas. |
-| `WRDA_IDEMPOTENCY_ENCRYPTION_KEYS` | `id:Base64[,id:Base64...]` | Key ring AES-256 para snapshots existentes y nuevos. |
-| `WRDA_IDEMPOTENCY_ENCRYPTION_CURRENT_KEY_ID` | ID dentro del ring | Identificador de la clave que cifra respuestas nuevas. |
 | `WRDA_IDEMPOTENCY_REQUIRE_AUTHENTICATED_IDENTITY` | `false` local | Al activarlo, rechaza identidad anónima. |
 | `wrda.idempotency.tenant-identity-attribute` | `tenant_id` | Nombre de atributo de tenant añadido al scope si está presente. |
-| `wrda.idempotency.max-response-bytes` | `1048576` | Tamaño máximo de snapshot antes del cifrado. |
+| `wrda.idempotency.max-response-bytes` | `1048576` | Tamaño máximo serializado de snapshot persistido. |
 | `wrda.idempotency.cleanup-every` | `5m` | Intervalo de borrado de `COMPLETED` vencidas. |
 | `SQLSERVER_USERNAME/PASSWORD/JDBC_URL` | Variables de entorno | Conexión opcional; perfil `-Dquarkus.profile=sqlserver`. |
 | `/db/schema.sql` | predeterminado | Esquema para H2. |
 | `/db/schema-sqlserver.sql` | perfil SQL Server | DDL demo para SQL Server; producción debe usar migraciones aprobadas. |
 
-No cambies HMAC de forma unilateral mientras existan registros vigentes: cambia el identificador persistido. En rotación de cifrado, conserva las claves históricas hasta que no queden snapshots que dependan de ellas.
+No cambies HMAC de forma unilateral mientras existan registros vigentes: cambiará los identificadores persistidos. Los snapshots son legibles por la aplicación y por el usuario de base con permisos; restringe/audita ese acceso y habilita cifrado en reposo aprobado.
 
 ## Límites que conviene recordar al leer
 
@@ -389,7 +377,7 @@ Lee en este orden para seguir una sola petición desde HTTP hasta la persistenci
 6. `src/main/java/com/wrda/application/idempotency/port/out/IdempotencyStore.java` — puerto hexagonal.
 7. `src/main/java/com/wrda/application/idempotency/IdempotencyService.java` — casos de uso de adquirir/completar/liberar/limpiar.
 8. `src/main/java/com/wrda/infrastructure/idempotency/persistence/IdempotencyRepository.java` y `IdempotencyRecord.java` — adaptador Panache y reserva SQL atómica.
-9. `src/main/java/com/wrda/infrastructure/idempotency/http/ResponseSnapshot.java` y `src/main/java/com/wrda/infrastructure/idempotency/security/ResponseEncryption.java` — forma y protección del resultado reproducible.
+9. `src/main/java/com/wrda/infrastructure/idempotency/http/ResponseSnapshot.java` e `IdempotencyResponseHandler.java` — serialización, persistencia y reconstrucción del resultado; no hay cifrado de respuesta en la aplicación.
 10. `src/main/java/com/wrda/infrastructure/orders/http/OrderResourceAdapter.java` — endpoint consumidor y frontera transaccional.
 11. `src/main/java/com/wrda/application/orders/CreateOrderService.java`, `src/main/java/com/wrda/domain/Order.java` y `src/main/java/com/wrda/infrastructure/orders/persistence/OrderRepository.java` — caso de uso, dominio y adaptador de negocio.
 12. `src/main/resources/db/schema.sql`, `src/main/resources/application.properties` y `src/main/openapi/orders.yaml` — almacenamiento, configuración y contrato.

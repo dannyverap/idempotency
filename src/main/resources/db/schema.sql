@@ -4,13 +4,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     request_hash    CHAR(64)     NOT NULL,
     status          VARCHAR(20)  NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED')),
     status_code     INTEGER,
-    encrypted_response CLOB,
+    response_snapshot CLOB,
     created_at      BIGINT       NOT NULL,
     updated_at      BIGINT       NOT NULL,
     expires_at      BIGINT       NOT NULL
 );
--- Compatibilidad con una base H2 creada por versiones anteriores de esta demo.
-ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS encrypted_response CLOB;
+-- Añade el snapshot nuevo sin borrar encrypted_response de instalaciones previas.
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS response_snapshot CLOB;
 
 CREATE INDEX IF NOT EXISTS ix_idempotency_expires_at ON idempotency_keys (expires_at);
 

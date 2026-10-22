@@ -63,7 +63,7 @@ public class IdempotencyRepository
       IdempotencyRecord idempotencyRecord = find("idempotencyKey", key).firstResult();
       return idempotencyRecord == null ? null
           : new IdempotencyEntry(idempotencyRecord.requestHash, idempotencyRecord.status,
-              idempotencyRecord.statusCode, idempotencyRecord.encryptedResponse,
+              idempotencyRecord.statusCode, idempotencyRecord.responseSnapshot,
               idempotencyRecord.createdAt, idempotencyRecord.updatedAt,
               idempotencyRecord.expiresAt);
     });
@@ -101,12 +101,12 @@ public class IdempotencyRepository
 
   /** IN_PROGRESS -> COMPLETED en la misma transacción que las escrituras del negocio. */
   @Override
-  public boolean markCompleted(String key, int statusCode, String encryptedResponse,
+  public boolean markCompleted(String key, int statusCode, String responseSnapshot,
       long now, long expiresAt) {
     return persistence("complete idempotency key", () -> {
-      int rows = update("status = ?1, statusCode = ?2, encryptedResponse = ?3, "
+      int rows = update("status = ?1, statusCode = ?2, responseSnapshot = ?3, "
               + "updatedAt = ?4, expiresAt = ?5 where idempotencyKey = ?6 and status = ?7",
-          IdempotencyStatus.COMPLETED, statusCode, encryptedResponse, now, expiresAt,
+          IdempotencyStatus.COMPLETED, statusCode, responseSnapshot, now, expiresAt,
           key, IdempotencyStatus.IN_PROGRESS);
       return rows == 1;
     });

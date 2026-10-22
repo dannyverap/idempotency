@@ -2,8 +2,12 @@ package com.wrda.idempotency;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import com.wrda.infrastructure.idempotency.security.IdempotencyHmac;
+import jakarta.inject.Inject;
+import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.Test;
 
+import java.sql.Clob;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -11,10 +15,17 @@ import java.util.concurrent.TimeUnit;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class IdempotencyReplayTest {
+    @Inject
+    EntityManager entityManager;
+
+    @Inject
+    IdempotencyHmac hmac;
+
     @Test
     void sameRequestReplaysIdenticalResponseAndDifferentPayloadIsRejected() {
         String key = UUID.randomUUID().toString();
@@ -62,6 +73,25 @@ class IdempotencyReplayTest {
         assertEquals(500, firstFailure.statusCode());
         // A stuck reservation would return 409; 500 proves the request was retried through the handler.
         assertEquals(500, retry.statusCode());
+    }
+
+    @Test
+    void responseSnapshotIsSerializedJsonWithoutApplicationEncryption() throws Exception {
+        String key = UUID.randomUUID().toString();
+        Response response = post("/api/orders", key,
+                "{\"customerId\":\"SNAPSHOT-PLAINTEXT-CHECK\",\"amount\":18.25}");
+        assertEquals(201, response.statusCode());
+
+        String storageKey = hmac.idempotencyKey("anonymous", "POST", "/api/orders", key);
+        Object stored = entityManager.createNativeQuery(
+                        "select response_snapshot from idempotency_keys where idempotency_key = ?1")
+                .setParameter(1, storageKey)
+                .getSingleResult();
+
+        Clob snapshotClob = assertInstanceOf(Clob.class, stored);
+        String snapshot = snapshotClob.getSubString(1, (int) snapshotClob.length());
+        assertTrue(snapshot.startsWith("{\"status\":"));
+        assertTrue(snapshot.contains("SNAPSHOT-PLAINTEXT-CHECK"));
     }
 
     private Response post(String path, String key, String body) {

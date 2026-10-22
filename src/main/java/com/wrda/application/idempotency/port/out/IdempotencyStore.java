@@ -9,7 +9,7 @@ public interface IdempotencyStore {
 
     IdempotencyEntry findEntry(String key);
 
-    boolean markCompleted(String key, int statusCode, String encryptedResponse, long now,
+    boolean markCompleted(String key, int statusCode, String responseSnapshot, long now,
                           long expiresAt);
 
     long releaseInProgress(String key);
