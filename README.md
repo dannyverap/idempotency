@@ -51,7 +51,7 @@ La reserva se confirma en una transacción corta antes del negocio. En contraste
 
 - `domain`: entidades/validaciones de negocio, sin dependencias de idempotencia ni eventos concretos.
 - `application/idempotency`: servicio de aplicación y puerto `IdempotencyStore`.
-- `infrastructure/idempotency/http`: anotación CDI, captura HTTP, fingerprint y short-circuit del replay.
+- `infrastructure/idempotency/http`: anotación CDI y componentes HTTP separados para validar la clave, construir la huella, resolver el ámbito de identidad, generar errores y capturar/reproducir respuestas.
 - `infrastructure/idempotency/security`: HMAC y cifrado AES-GCM.
 - `infrastructure/idempotency/persistence`: Panache, SQL y limpieza de claves COMPLETED vencidas.
 - `infrastructure/orders`: ejemplo HTTP y persistencia del dominio.
@@ -95,7 +95,16 @@ curl -i -X POST http://localhost:8080/api/orders \
 
 Repetir exactamente esa llamada devuelve la misma respuesta con `Idempotency-Replayed: true`. Cambiar el payload y conservar la clave devuelve `422`. Mientras la primera llamada esté activa, una petición simultánea devuelve `409`. La ruta `POST /api/orders/with-payment` prueba replay de respuesta compuesta.
 
-Las pruebas de integración en `src/test` cubren replay byte-a-byte, rechazo de payload distinto, concurrencia, liberación luego de una falla y replay de orden+pago. Los secretos deterministas de `src/test/resources/application.properties` son únicamente para las pruebas automatizadas.
+Las pruebas de integración en `src/test` cubren replay byte-a-byte, rechazo de payload distinto, concurrencia, liberación luego de una falla y replay de orden+pago. `IdempotencyKeyValidatorTest` cubre headers ausentes/duplicados y claves inválidas. Los secretos deterministas de `src/test/resources/application.properties` son únicamente para las pruebas automatizadas.
+
+### Ruta de lectura del interceptor
+
+1. `WrdaIdempotency` define el binding CDI y `WrdaManagedEndpoint` lo combina con el manejo de errores.
+2. `WrdaIdempotencyInterceptor` es el orquestador: valida precondiciones, coordina colaboradores y traduce el estado de adquisición a la respuesta HTTP.
+3. `IdempotencyKeyValidator` valida el header, y `IdempotencyRequestIdentityResolver` obtiene el ámbito principal/tenant y deriva identificadores HMAC.
+4. `RequestFingerprintBuilder` serializa método, ruta, query y argumentos HTTP excluyendo el parámetro `Idempotency-Key`.
+5. `IdempotencyService` adquiere la reserva y decide entre continuar, replay, conflicto o reutilización de clave.
+6. `IdempotencyResponseHandler` ejecuta el endpoint una sola vez, captura/cifra el resultado exitoso o descifra y reconstruye el replay. `ResponseSnapshot` define qué cuerpo y encabezados se conservan.
 
 ## Alcance de producción
 
